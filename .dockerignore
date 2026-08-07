@@ -1,0 +1,17 @@
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+.vscode/
+.vscode-server/
+
+.git/
+.gitignore
+
+Dockerfile
+.dockerignore
+
+*.log
