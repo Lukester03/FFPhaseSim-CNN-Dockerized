@@ -52,8 +52,9 @@ class ArrayDesign:
 
 class TurbulenceModeler:
     def __init__(self, wavelength: float = 1064e-9, 
-    outer_scale: float = np.inf, grid_size: int = 2048, screen_physical_size: float = 2.0, grnd_speed = 5.0):
+    outer_scale: float = np.inf, grid_size: int = 2048, screen_physical_size: float = 2.0, grnd_speed = 5.0, fried_mult = 1.0):
         self.phase_catalog = None
+        self.fried_mult = fried_mult
         self.wavelen = wavelength
         self.outer_scale = outer_scale
         self.grid_size = grid_size
@@ -74,7 +75,7 @@ class TurbulenceModeler:
         struct_fxn = (5.94e-23 * heights ** 10 * (v_rms / 27) ** 2 * np.exp(-heights) + b_value * 2.7e-16 * np.exp(-2 * heights / 3))
         struct_fxn_integral = np.trapz(y = struct_fxn, x = heights * 1000)
         k_wavenum = self.wavelen ** -1 * 2 * np.pi
-        r0 = (0.423 * 0.5 * struct_fxn_integral * k_wavenum ** 2) ** (-3/5)
+        r0 = (0.423 * 0.5 * struct_fxn_integral * k_wavenum ** 2) ** (-3/5) * self.fried_mult
         return r0
 
     def phase_screen_gen(self, height1, height2, random_seed = None, b_val = None):
@@ -109,7 +110,7 @@ class TurbulenceModeler:
             self.phase_catalog[i] = phase_screen
 
 class BeamPerturbator:
-    def __init__(self, targ_pos: list, array_des: ArrayDesign, grid_length: np.float64 = 1024):
+    def __init__(self, targ_pos: list, array_des: ArrayDesign, grid_length: np.float64 = 1024, Ideal = True, fried_mult = 1.0):
         self.waist = self.apert_radi = self.wavelength = self.spatial_samp_length = np.float64(0)
         self.chan_amps = self.turb_model = self.phase_screens = self.apply_turb = None
         self.target_position = targ_pos
@@ -117,7 +118,7 @@ class BeamPerturbator:
         self.grid_length = grid_length
         self.set_rel_phases()
         self.chan_rel_phases = np.zeros(self.rel_array.arrayvector.shape[0])
-        self.set_beam_elements()
+        self.set_beam_elements(ideal = Ideal, fried_mult = fried_mult)
 
     def set_beam_elements(self,
                           clip_ratio: np.float64 = 0.6,
@@ -126,7 +127,8 @@ class BeamPerturbator:
                           init_amp: np.complex128 = 10,
                           ssl: np.float64 = 4e-4,
                           ideal: bool = True,
-                          gaussian: bool = True):
+                          gaussian: bool = True,
+                          fried_mult = 1.0):
         self.chan_amps = np.full(self.rel_array.arrayvector.shape[0], init_amp)
         self.waist = apert_radi * clip_ratio
         self.apert_radi = apert_radi
@@ -142,7 +144,7 @@ class BeamPerturbator:
         self.phase_screens = None
         self.apply_turb = not ideal
         if not ideal:
-            self.turb_model = TurbulenceModeler(wavelength = wavelength, grid_size = self.grid_length)
+            self.turb_model = TurbulenceModeler(wavelength = wavelength, grid_size = self.grid_length, fried_mult=fried_mult)
             self.generate_turbulence()
         
     def generate_turbulence(self, b_val = 1, random_seed = None):
@@ -200,11 +202,40 @@ class BeamPerturbator:
             input_e += amp_prof * self.chan_amps[n] * np.exp(1j * total_phase)
         return input_e, x, y
 
+    def fresnel_czt(self, input_field, z: np.float64, k):
+        dim_y, dim_x = input_field.shape
+        ssl = self.spatial_samp_length
+        x1 = (np.arange(dim_x) - dim_x / 2) * ssl
+        y1 = (np.arange(dim_y) - dim_y / 2) * ssl
+        X1, Y1 = np.meshgrid(x1,y1)
+        Q1 = np.exp((1j * k * (X1 ** 2 + Y1 ** 2)) / (2 * z))
+        array_extent = (self.element_positions[:,0].max() - self.element_positions[:,0].min())
+        d_array = array_extent + 2 * self.apert_radi
+        diff_limited_spot = self.wavelength * z / d_array
+        out_window = 30 * diff_limited_spot
+        E_mod = input_field * Q1
+        out_size = self.grid_length
+        out_center = [0,0]
+        dx_out = out_window / out_size
+        x2 = out_center[0] + (np.arange(out_size) - out_size // 2) * dx_out
+        y2 = out_center[1] + (np.arange(out_size) - out_size // 2) * dx_out
+        def make_czt(f_axis, n_in):
+            df, f0 = f_axis[1] - f_axis[0], f_axis[0]
+            W = np.exp(-1j * 2 * np.pi * df * ssl)
+            A = np.exp(1j * 2 * np.pi * f0 * ssl)
+            return CZT(n_in, out_size, W, A)
+        tmp = make_czt(x2 / (self.wavelength * z), dim_x)(E_mod, axis=1)
+        tmp = make_czt(y2 / (self.wavelength * z), dim_y)(tmp, axis=0)
+        prefactor = np.exp(1j * k * z) / (1j * self.wavelength * z)
+        X2, Y2 = np.meshgrid(x2, y2)
+        Q2 = np.exp(1j * k * (X2 ** 2 + Y2 ** 2) / (2 * z))
+        output_field = prefactor * Q2 * tmp * ssl ** 2
+        return output_field, x2, y2
+
     def fresnel_propagation(self, input_field, z: np.float64):
         dim_y, dim_x = input_field.shape
         ssl = self.spatial_samp_length
         k = 2 * np.pi / self.wavelength
-
         if self.apply_turb:
             fx = np.fft.fftfreq(dim_x, d=ssl)
             fy = np.fft.fftfreq(dim_y, d=ssl)
@@ -225,43 +256,12 @@ class BeamPerturbator:
                 z_current = altitude
             dist_remainder = z-z_current
             if dist_remainder > 0:
-                H = np.exp(1j * k * dist_remainder) * np.exp(-1j * np.pi * self.wavelength * dist_remainder * (FX ** 2 + FY ** 2))
-                field = ifft2(fft2(field) * H)
-            x_out = (np.arange(dim_x) - dim_x / 2) * ssl
-            y_out = (np.arange(dim_y) - dim_y / 2) * ssl
-            return field, x_out, y_out
-        #vacuum CZT-based single Fresnel Integral
-        array_extent = (self.element_positions[:,0].max() - self.element_positions[:,0].min())
-        d_array = array_extent + 2 * self.apert_radi
-        diff_limited_spot = self.wavelength * z / d_array
-        out_window = 30 * diff_limited_spot
-        x1 = (np.arange(dim_x) - dim_x / 2) * ssl
-        y1 = (np.arange(dim_y) - dim_y / 2) * ssl
-        X1, Y1 = np.meshgrid(x1,y1)
-        Q1 = np.exp((1j * k * (X1 ** 2 + Y1 ** 2)) / (2 * z))
-        E_mod = input_field * Q1
-        out_size = self.grid_length
-        out_center = [0,0]
-        
-        dx_out = out_window / out_size
-        x2 = out_center[0] + (np.arange(out_size) - out_size // 2) * dx_out
-        y2 = out_center[1] + (np.arange(out_size) - out_size // 2) * dx_out
- 
-        def make_czt(f_axis, n_in):
-            df, f0 = f_axis[1] - f_axis[0], f_axis[0]
-            W = np.exp(-1j * 2 * np.pi * df * ssl)
-            A = np.exp(1j * 2 * np.pi * f0 * ssl)
-            return CZT(n_in, out_size, W, A)
- 
-        tmp = make_czt(x2 / (self.wavelength * z), dim_x)(E_mod, axis=1)
-        tmp = make_czt(y2 / (self.wavelength * z), dim_y)(tmp, axis=0)
- 
-        prefactor = np.exp(1j * k * z) / (1j * self.wavelength * z)
-        X2, Y2 = np.meshgrid(x2, y2)
-        Q2 = np.exp(1j * k * (X2 ** 2 + Y2 ** 2) / (2 * z))
-        output_field = prefactor * Q2 * tmp * ssl ** 2
- 
-        return output_field, x2, y2
+                return self.fresnel_czt(input_field = field, z = dist_remainder, k = k)
+            else:
+                x_out = (np.arange(dim_x) - dim_x / 2) * ssl
+                y_out = (np.arange(dim_y) - dim_y / 2) * ssl
+                return field, x_out, y_out
+        return self.fresnel_czt(input_field = input_field, z = z, k = k)
 
 class ZernikeFilterBank:
     def __init__(self, kernel_size=21, num_modes=36):
@@ -483,7 +483,6 @@ class GaborConvLayer(layers.Layer):
         in_channels = input_grid[-1]
         # Get kernels from filter bank: [H, W, num_filters]
         kernels = self.filter_bank.kernel_bank
-        print(kernels.shape)
         
         # Expand for conv2d: [H, W, in_channels, out_channels]
         kernels = tf.tile(kernels, [1, 1, in_channels, 1])  # [H, W, C, F]
@@ -653,10 +652,10 @@ class FFPhaseCNN(Model):
         return phases, coefficients, attention_maps
 
 if __name__ == "__main__":
-    dist = np.float64(1600000)
-    target = [30, 10, dist]
+    dist = np.float64(384000000)
+    target = [0, 0, dist]
     john_array = ArrayDesign(2, 'hex')
-    john_perturbation = BeamPerturbator(target, john_array)
+    john_perturbation = BeamPerturbator(target, john_array, Ideal = True, fried_mult = 1.0)
     e_field, x_in, y_in = john_perturbation.input_e_field()
     e_field_ff, x_out, y_out = john_perturbation.fresnel_propagation(e_field, dist)
     I_field = np.abs(e_field) ** 2
