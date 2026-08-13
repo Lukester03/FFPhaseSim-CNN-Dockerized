@@ -8,6 +8,7 @@ warnings.filterwarnings('ignore')
 import matplotlib
 matplotlib.use('Agg')
 
+from datetime import datetime
 import numpy as np
 import math
 import random
@@ -15,6 +16,7 @@ import tensorflow as tf
 import soapy
 from keras import layers, Model
 import matplotlib.pyplot as plt
+from scipy.signal import CZT
 from numpy.fft import fft2, ifft2, fftshift, ifftshift
 
 
@@ -36,20 +38,21 @@ class ArrayDesign:
                 for col in range(n_in_row):
                     y = col - (n_in_row - 1) / 2.0
                     positions_list.append([x, y])
-
         elif shape == "square":
             for row in range(sidelen):
                 x = row - (sidelen - 1) / 2.0
                 for col in range(sidelen):
                     y = col - (sidelen - 1) / 2.0
                     positions_list.append([x, y])
+        else:
+            raise ValueError("Unsupported shape. Use 'hex' or 'square'.")
 
         positions_array = np.array(positions_list, dtype=np.float64)
         self.arrayvector = np.column_stack((positions_array, np.zeros(positions_array.shape[0])))
 
 class TurbulenceModeler:
     def __init__(self, wavelength: float = 1064e-9, 
-    outer_scale: float = np.inf, grid_size: int = 256, screen_physical_size: float = 2.0, grnd_speed = 5.0):
+    outer_scale: float = np.inf, grid_size: int = 2048, screen_physical_size: float = 2.0, grnd_speed = 5.0):
         self.phase_catalog = None
         self.wavelen = wavelength
         self.outer_scale = outer_scale
@@ -106,33 +109,41 @@ class TurbulenceModeler:
             self.phase_catalog[i] = phase_screen
 
 class BeamPerturbator:
-    def __init__(self, targ_pos: list, array_des: ArrayDesign):
+    def __init__(self, targ_pos: list, array_des: ArrayDesign, grid_length: np.float64 = 1024):
         self.waist = self.apert_radi = self.wavelength = self.spatial_samp_length = np.float64(0)
         self.chan_amps = self.turb_model = self.phase_screens = self.apply_turb = None
         self.target_position = targ_pos
         self.rel_array = array_des
+        self.grid_length = grid_length
         self.set_rel_phases()
         self.chan_rel_phases = np.zeros(self.rel_array.arrayvector.shape[0])
         self.set_beam_elements()
 
     def set_beam_elements(self,
-                          clip_ratio: np.float64 = 0.9,
+                          clip_ratio: np.float64 = 0.6,
                           apert_radi: np.float64 = 5e-2,
                           wavelength: np.float64 = 1064e-9,
                           init_amp: np.complex128 = 10,
-                          ssl: np.float64 = 1e-3, 
-                        ideal = False):
+                          ssl: np.float64 = 4e-4,
+                          ideal: bool = True,
+                          gaussian: bool = True):
         self.chan_amps = np.full(self.rel_array.arrayvector.shape[0], init_amp)
         self.waist = apert_radi * clip_ratio
         self.apert_radi = apert_radi
         self.wavelength = wavelength
         self.spatial_samp_length = ssl
-        self.rel_array.arrayvector *= apert_radi
-        #initializing turbulence module
-        self.turb_model = TurbulenceModeler(wavelength = wavelength)
+        self.gauss_power = gaussian
+
+        #Element spacing
+        self.element_space = 2 * self.apert_radi
+        self.element_positions = self.rel_array.arrayvector * self.element_space
+
+        #initializing turbulence module ONLY if non-ideal prop
         self.phase_screens = None
-        self.apply_turb = ideal
-        self.generate_turbulence()
+        self.apply_turb = not ideal
+        if not ideal:
+            self.turb_model = TurbulenceModeler(wavelength = wavelength, grid_size = self.grid_length)
+            self.generate_turbulence()
         
     def generate_turbulence(self, b_val = 1, random_seed = None):
         self.turb_model.all_screen_gen(
@@ -148,23 +159,23 @@ class BeamPerturbator:
         else:
             self.chan_rel_phases = np.zeros(self.rel_array.arrayvector.shape[0])
 
-    def input_e_field(self, grid_shape: list):
-        pos_apert = self.rel_array.arrayvector
-        dim_y, dim_x = grid_shape
+    def input_e_field(self):
+        # relevant constants
+        k = 2 * np.pi / self.wavelength
         ssl = self.spatial_samp_length
+        # aperture grid creation
+        pos_apert = self.element_positions
+        num_apertures = pos_apert.shape[0]
+        # output grid creation
+        dim_y, dim_x = [self.grid_length, self.grid_length]
         x = (np.arange(dim_x) - dim_x / 2) * ssl
         y = (np.arange(dim_y) - dim_y / 2) * ssl
         X, Y = np.meshgrid(x, y)
-        input_e = np.zeros(grid_shape, dtype=np.complex128)
-        k = 2 * np.pi / self.wavelength
-        num_apertures = pos_apert.shape[0]
+        input_e = np.zeros([dim_y, dim_x], dtype=np.complex128)
+
         x_f, y_f, z_f = self.target_position
         x_n = pos_apert[:, 0]
         y_n = pos_apert[:, 1]
-        if self.apply_turb == True:
-            turbulence_phase = self.phase_screens[0]
-        else:
-            turbulence_phase = np.zeros_like(self.phase_screens[0])
 
         # vectorized steering phases
         dx = x_f - x_n
@@ -172,6 +183,7 @@ class BeamPerturbator:
         R_target = np.sqrt(dx ** 2 + dy ** 2 + z_f ** 2)
         sin_theta_x = dx / R_target
         sin_theta_y = dy / R_target
+        piston = -k * R_target
 
         # summing over contributions from each aperture
         for n in range(num_apertures):
@@ -179,57 +191,77 @@ class BeamPerturbator:
             Y_local = Y - y_n[n]
             r = np.sqrt(X_local ** 2 + Y_local ** 2)
             aperture = (r <= self.apert_radi).astype(np.float64)
-            phi_steering = k * (sin_theta_x[n] * X_local + sin_theta_y[n] * Y_local)
-            phi_control = self.chan_rel_phases[n]
-            total_phase = phi_steering + phi_control + turbulence_phase
-            input_e += aperture * np.exp(1j * total_phase) * self.chan_amps[n]
-        return input_e
+            if self.gauss_power:
+                amp_prof = aperture * np.exp(-r ** 2 / self.waist ** 2)
+            else:
+                amp_prof = aperture
+            phi_steer = k * (sin_theta_x[n] * X_local + sin_theta_y[n] * Y_local)
+            total_phase = phi_steer + piston[n] + self.chan_rel_phases[n]
+            input_e += amp_prof * self.chan_amps[n] * np.exp(1j * total_phase)
+        return input_e, x, y
 
     def fresnel_propagation(self, input_field, z: np.float64):
         dim_y, dim_x = input_field.shape
-        # spatial freq grids
-        ssl = self.spatial_samp_length * max(math.log(z / 7363, 1.08), 1) # mathematical function to scale size of output plane, creates inexact spatiality but keeps primary pattern same size in graph.
-        dfx = 1 / (dim_x * ssl)
-        dfy = 1 / (dim_y * ssl)
-        fx = dfx * np.arange(-dim_x / 2, dim_x / 2)
-        fy = dfy * np.arange(-dim_y / 2, dim_y / 2)
+        ssl = self.spatial_samp_length
         k = 2 * np.pi / self.wavelength
-        FX, FY = np.meshgrid(fx, fy)
-        if self.apply_turb == True:
+
+        if self.apply_turb:
+            fx = np.fft.fftfreq(dim_x, d=ssl)
+            fy = np.fft.fftfreq(dim_y, d=ssl)
+            FX, FY = np.meshgrid(fx,fy)
+
+            z_atmo = min(z, 20000)
+            screen_num = min(len(self.phase_screens), int(round(z/500)))
             field = input_field.copy()
-            screen_num = len(self.phase_screens)
-            self.screen_heights = np.linspace(0 , z, num=screen_num+1)
+            screen_heights = np.linspace(0, z_atmo, num = screen_num + 1)
             z_current = 0.0
-            
-            for i in range(screen_num):
-                altitude = (self.screen_heights[i] + self.screen_heights[i+1]) / 2
+            for n in range(screen_num):
+                altitude = screen_heights[n+1]
                 dz = altitude - z_current
                 if dz > 0:
                     H = np.exp(1j * k * dz) * np.exp(-1j * np.pi * self.wavelength * dz * (FX ** 2 + FY ** 2))
-                    H = fftshift(H)
-                    field_fft = fft2(ifftshift(field))
-                    field = fftshift(ifft2(field_fft * H))
-                phase_screen = self.phase_screens[i]
-                field *= np.exp(1j * phase_screen)
+                    field = ifft2(fft2(field) * H)
+                field *= np.exp(1j * self.phase_screens[n])
                 z_current = altitude
             dist_remainder = z-z_current
             if dist_remainder > 0:
-                H = np.exp(1j * k * dist_remainder) * np.exp(-1j * np.pi * self.wavelength * dist_remainder *(FX ** 2 + FY ** 2))
-                H = fftshift(H)
-                field_fft = fft2(ifftshift(field))
-                field = fftshift(ifft2(field_fft * H))
-                output_field = field
-            else:
-                output_field = field
-        else:
-            # ideal fresnel transfer function
-            H = np.exp(1j * k * z) * np.exp(-1j * np.pi * self.wavelength * z * (FX ** 2 + FY ** 2))
-            H = fftshift(H)
-            # propagation
-            input_field_fft = fft2(ifftshift(input_field))
-            output_field_fft = input_field_fft * H
-            output_field = fftshift(ifft2(output_field_fft))
-        return output_field
+                H = np.exp(1j * k * dist_remainder) * np.exp(-1j * np.pi * self.wavelength * dist_remainder * (FX ** 2 + FY ** 2))
+                field = ifft2(fft2(field) * H)
+            x_out = (np.arange(dim_x) - dim_x / 2) * ssl
+            y_out = (np.arange(dim_y) - dim_y / 2) * ssl
+            return field, x_out, y_out
+        #vacuum CZT-based single Fresnel Integral
+        array_extent = (self.element_positions[:,0].max() - self.element_positions[:,0].min())
+        d_array = array_extent + 2 * self.apert_radi
+        diff_limited_spot = self.wavelength * z / d_array
+        out_window = 30 * diff_limited_spot
+        x1 = (np.arange(dim_x) - dim_x / 2) * ssl
+        y1 = (np.arange(dim_y) - dim_y / 2) * ssl
+        X1, Y1 = np.meshgrid(x1,y1)
+        Q1 = np.exp((1j * k * (X1 ** 2 + Y1 ** 2)) / (2 * z))
+        E_mod = input_field * Q1
+        out_size = self.grid_length
+        out_center = [0,0]
+        
+        dx_out = out_window / out_size
+        x2 = out_center[0] + (np.arange(out_size) - out_size // 2) * dx_out
+        y2 = out_center[1] + (np.arange(out_size) - out_size // 2) * dx_out
+ 
+        def make_czt(f_axis, n_in):
+            df, f0 = f_axis[1] - f_axis[0], f_axis[0]
+            W = np.exp(-1j * 2 * np.pi * df * ssl)
+            A = np.exp(1j * 2 * np.pi * f0 * ssl)
+            return CZT(n_in, out_size, W, A)
+ 
+        tmp = make_czt(x2 / (self.wavelength * z), dim_x)(E_mod, axis=1)
+        tmp = make_czt(y2 / (self.wavelength * z), dim_y)(tmp, axis=0)
+ 
+        prefactor = np.exp(1j * k * z) / (1j * self.wavelength * z)
+        X2, Y2 = np.meshgrid(x2, y2)
+        Q2 = np.exp(1j * k * (X2 ** 2 + Y2 ** 2) / (2 * z))
+        output_field = prefactor * Q2 * tmp * ssl ** 2
+ 
+        return output_field, x2, y2
 
 class ZernikeFilterBank:
     def __init__(self, kernel_size=21, num_modes=36):
@@ -621,33 +653,42 @@ class FFPhaseCNN(Model):
         return phases, coefficients, attention_maps
 
 if __name__ == "__main__":
-    dist = np.float64(160000)
+    dist = np.float64(1600000)
+    target = [30, 10, dist]
     john_array = ArrayDesign(2, 'hex')
-    john_perturbation = BeamPerturbator([0, 0, dist], john_array)
-    e_field = john_perturbation.input_e_field([256, 256])
-    e_field_ff = john_perturbation.fresnel_propagation(e_field, dist)
-    e_field = e_field
+    john_perturbation = BeamPerturbator(target, john_array)
+    e_field, x_in, y_in = john_perturbation.input_e_field()
+    e_field_ff, x_out, y_out = john_perturbation.fresnel_propagation(e_field, dist)
     I_field = np.abs(e_field) ** 2
     I_field_ff = np.abs(e_field_ff) ** 2
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-    # First heatmap
-    im1 = ax1.imshow(I_field, cmap='plasma', aspect='auto', norm='linear', origin='upper')
+    peak_idx = np.unravel_index(np.argmax(I_field_ff), I_field_ff.shape)
+    print(f"target = ({target[0]}, {target[1]}) m at z = {dist/1e3:.0f} km")
+    print(f"far-field peak at x={x_out[peak_idx[1]]:.3f} m, y={y_out[peak_idx[0]]:.3f} m")
+ 
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+ 
+    im1 = ax1.imshow(I_field, cmap='plasma', origin='lower',
+                      extent=[x_in.min(), x_in.max(), y_in.min(), y_in.max()])
     ax1.set_title('Intensity at Apertures')
-    ax1.set_xlabel('Columns')
-    ax1.set_ylabel('Rows')
+    ax1.set_xlabel('x [m]')
+    ax1.set_ylabel('y [m]')
     plt.colorbar(im1, ax=ax1)
-
-    # Second heatmap
-    im2 = ax2.imshow(I_field_ff, cmap='plasma', aspect='auto', norm='linear', origin='upper')
+ 
+    im2 = ax2.imshow(I_field_ff, cmap='plasma', origin='lower',
+                      extent=[x_out.min(), x_out.max(), y_out.min(), y_out.max()])
+    ax2.plot(target[0], target[1], '+', color='cyan', markersize=12, mew=2)
     ax2.set_title('Intensity at Far Field')
-    ax2.set_xlabel('Columns')
-    ax2.set_ylabel('Rows')
+    ax2.set_xlabel('x [m]')
+    ax2.set_ylabel('y [m]')
     plt.colorbar(im2, ax=ax2)
-
+ 
     plt.tight_layout()
-    plt.savefig('/workspace/outputs/intensity_plots.png', dpi=300, bbox_inches='tight')
-
+    out_dir = 'outputs'
+    os.makedirs(out_dir, exist_ok=True)  # FIX: no longer a hardcoded /workspace/ path
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    plt.savefig(f'{out_dir}/intensity_plots_{timestamp}.png', dpi=300, bbox_inches='tight')
     plt.close(fig)
 
 if __name__ == "not __main__":
