@@ -95,19 +95,22 @@ class TurbulenceModeler:
             SH=True
         )
 
-        return phase_screens[0]
+        return phase_screens[0], r0
 
     def all_screen_gen(self, random_seed = None, 
         b_val = None, gen_height = 20000):
+        r0_total = 0
         screen_count = 32
         nx = self.grid_size
         self.phase_catalog = np.zeros((screen_count, nx, nx))
         screen_heights = np.linspace(0, gen_height, num = (screen_count+1))
         for i in range(screen_count):
-            phase_screen = self.phase_screen_gen(random_seed = 
+            phase_screen, r0 = self.phase_screen_gen(random_seed = 
             random_seed, b_val = b_val, height1 = screen_heights[i], 
             height2 = screen_heights[i+1])
+            r0_total += r0 ** (-5/3)
             self.phase_catalog[i] = phase_screen
+        print(r0_total ** -3/5)
 
 class BeamPerturbator:
     def __init__(self, targ_pos: list, array_des: ArrayDesign, grid_length: np.float64 = 1024, Ideal = True, fried_mult = 1.0):
@@ -291,10 +294,10 @@ class ZernikeFilterBank:
         filters = np.zeros((self.kernel_size, self.kernel_size, 1, self.num_modes))
 
         for J in range(self.num_modes):
-            n = int(np.ceil((np.sqrt(8*J + 1) - 1) / 2))
+            n = int(np.ceil((np.sqrt(9 + 8*J) - 3) / 2))
             m = 2*J - n * (n + 2)
 
-            if J % 2 == 0:
+            if m >= 0:
                 Z = self.radial_polynomial(n, abs(m)) * np.cos(m * self.theta)
             else:
                 Z = self.radial_polynomial(n, abs(m)) * np.sin(abs(m) * self.theta)
@@ -304,9 +307,7 @@ class ZernikeFilterBank:
                 Z[self.mask] /= np.std(Z[self.mask]) + 1e-8
 
             filters[..., 0, J] = Z * self.mask
-
         return filters
-
 
 class GaborFilterBank(layers.Layer):
     def __init__(self,
@@ -432,7 +433,7 @@ class ZernikeConvLayer(layers.Layer):
              [pad_size, pad_size],
              [pad_size, pad_size],
              [0, 0]],
-            mode='CONSTANT'
+            mode='REFLECT'
         )
 
         output = tf.nn.conv2d(
@@ -536,85 +537,109 @@ class GaborConvLayer(layers.Layer):
         })
         return config
 
+class FiLMConditioner(layers.Layer):
+    def __init__(self, num_features, **kwargs):
+        super().__init__(**kwargs)
+        self.mlp = tf.keras.Sequential([
+            layers.Dense(32,activation='relu'),
+            layers.Dense(2 * num_features),
+        ])
+    def call(self, features, position):
+        gb = self.mlp(position)
+        gamma, beta = tf.split(gb, 2, axis=-1)
+        gamma = gamma[:, None, None, :]
+        beta = beta[:, None, None, :]
+        return features * (1 + gamma) + beta
+
 class FFPhaseCNN(Model):
     def __init__(self, input_grid: list = [256, 256, 1], mode_count=36, 
         gabor_kernel_size = 15, gabor_orientations = 8, gabor_lmbda = None, laser_count = 7,
-        **kwargs):
+        element_positions = [], processor_channels = [64, 64, 32], **kwargs):
         super().__init__(**kwargs)
         self.input_grid = input_grid
         self.num_modes = mode_count
         self.gabor_kern_size = gabor_kernel_size
-        self.gabor_orientations = 8
+        self.gabor_orientations = gabor_orientations
         self.gabor_lmbda = gabor_lmbda
         self.num_lasers = laser_count
+        self.element_positions = np.asarray(element_positions)
         
         # Non-trainable filter layers:
         
         self.zernike_conv = ZernikeConvLayer(kernel_size = 21, num_modes = mode_count, name = "zernike_features")
         self.gabor_conv = GaborConvLayer(kernel_size = gabor_kernel_size, 
-        num_orientations = gabor_orientations, wavelengths = None, gamma = 0.5, name = "gabor_features")
+        num_orientations = gabor_orientations, wavelengths = gabor_lmbda, gamma = 0.5, name = "gabor_features")
+
+        # Processor Channel Counts:
+
+        self.Zernike_chan = int(processor_channels[0])
+        self.Gabor_chan = int(processor_channels[1])
+        self.Raw_chan = int(processor_channels[2])
         
         # Processors
         self.zernike_processor = tf.keras.Sequential([
             layers.BatchNormalization(name='zernike_bn'),
-            layers.Conv2D(64, 1, activation='relu', name='zernike_compress'),
-            layers.Conv2D(64, 3, padding='SAME', activation='relu', 
+            layers.Conv2D(self.Zernike_chan, 1, activation='relu', name='zernike_compress'),
+            layers.Conv2D(self.Zernike_chan, 3, padding='SAME', activation='relu', 
                          name='zernike_process1'),
-            layers.Conv2D(64, 3, padding='SAME', activation='relu', 
+            layers.Conv2D(self.Zernike_chan, 3, padding='SAME', activation='relu', 
                          name='zernike_process2'),
         ], name='zernike_processor')
         
         self.gabor_processor = tf.keras.Sequential([
             tf.keras.layers.BatchNormalization(name='gabor_bn'),
-            layers.Conv2D(64, 1, activation='relu', name='gabor_compress'),
-            layers.Conv2D(64, 3, padding='SAME', activation='relu', 
+            layers.Conv2D(self.Gabor_chan, 1, activation='relu', name='gabor_compress'),
+            layers.Conv2D(self.Gabor_chan, 3, padding='SAME', activation='relu', 
                          name='gabor_process1'),
-            layers.Conv2D(64, 3, padding='SAME', activation='relu', 
+            layers.Conv2D(self.Gabor_chan, 3, padding='SAME', activation='relu', 
                          name='gabor_process2'),
         ], name='gabor_processor')
         
         self.intensity_processor = tf.keras.Sequential([
-            layers.Conv2D(32, 7, padding='SAME', activation='relu', 
+            layers.Conv2D(self.Raw_chan, 7, padding='SAME', activation='relu', 
                          name='intensity_conv1'),
             layers.BatchNormalization(name='intensity_bn1'),
-            layers.Conv2D(32, 5, padding='SAME', activation='relu', 
+            layers.Conv2D(self.Raw_chan, 5, padding='SAME', activation='relu', 
                          name='intensity_conv2'),
         ], name='intensity_processor')
         
         #Laser attention to separate lasers in image
         self.laser_attention = tf.keras.Sequential([
             layers.Conv2D(64, 1, activation='relu'),
-            layers.Conv2D(self.num_lasers, 1, activation='softmax'),
+            layers.Conv2D(self.num_lasers, 1, activation='sigmoid'),
         ], name='laser_attention')
         
         #decodes each laser's values
-        self.laser_decoders = []
-        for i in range(self.num_lasers):
-            decoder = tf.keras.Sequential([
-                layers.Conv2D(64, 3, padding='SAME', activation='relu'),
-                layers.BatchNormalization(),
-                layers.Conv2D(32, 3, padding='SAME', activation='relu'),
-                layers.BatchNormalization(),
-                layers.Conv2D(16, 3, padding='SAME', activation='relu'),
-                layers.Conv2D(2, 3, padding='SAME'),  # sin & cos
-            ], name=f'laser{i}_decoder')
-            self.laser_decoders.append(decoder)
-        
+        self.shared_decoder = tf.keras.Sequential([
+            layers.Conv2D(64, 3, padding='SAME', activation='relu'),
+            layers.BatchNormalization(),
+            layers.Conv2D(32, 3, padding='SAME', activation='relu'),
+            layers.BatchNormalization(),
+            layers.Conv2D(16, 3, padding='SAME', activation='relu'),
+            layers.Conv2D(2, 3, padding='SAME'),
+        ], name='shared_decoder')
+
+        self.film = FiLMConditioner(sum(processor_channels)+1)
         self.global_pool = layers.GlobalAveragePooling2D()
-        self.coeff_predictors = []
-        for i in range(self.num_lasers):
-            predictor = tf.keras.Sequential([
-                layers.Dense(128, activation='relu'),
-                layers.Dropout(0.3),
-                layers.Dense(64, activation='relu'),
-                layers.Dense(self.num_modes),
-            ], name=f'laser{i}_coeff_predictor')
-            self.coeff_predictors.append(predictor)
+
+    def reconstruct_phase(self, coeffs, zernike_basis, aperture_mask):
+        phase = tf.einsum('bm,hwm->bhw', coeffs, zernike_basis)
+        return phase[..., None] * aperture_mask
     
     def call(self, inputs, training = False):
         zernike_raw = self.zernike_conv(inputs)  # [B, H, W, 36]
         gabor_raw = self.gabor_conv(inputs)      # [B, H, W, 80]
-            
+        # coefficients
+        self.coeff_head = tf.keras.Sequential([
+            layers.Dense (64, activation='relu'),
+            layers.Dense(self.num_modes),
+        ], name = 'coeff_head')
+        pooled = self.global_pool(conditioned)
+        coeffs = self.coeff_head(pooled)
+
+        # Zernike Basis for reconstructing phase
+        zernike_basis = ZernikeFilterBank(256).generate_filter_bank()
+
         # Features processing
         z_features = self.zernike_processor(zernike_raw, training=training)
         g_features = self.gabor_processor(gabor_raw, training=training)
@@ -629,33 +654,26 @@ class FFPhaseCNN(Model):
         # Phase decoder
         phases = []
         for i in range(self.num_lasers):
-            # Weight features by attention for this laser
-            laser_mask = attention_maps[..., i:i+1]  # [B, H, W, 1]
-            laser_features = combined * laser_mask   # [B, H, W, 160]
-            
-            # Decode to phase
-            phase_components = self.laser_decoders[i](laser_features, training=training)
+            laser_mask = attention_maps[..., i:i+1]
+            laser_features = combined * laser_mask
+            pos = tf.constant([[self.element_positions[i,0], self.element_positions[i,1]]], dtype=tf.float32)
+            pos = tf.tile(pos, [tf.shape(inputs)[0], 1])
+            conditioned = self.film(laser_features, pos)
+            phase_components = self.shared_decoder(conditioned, training=training)
             phase_sin = phase_components[..., 0:1]
             phase_cos = phase_components[..., 1:2]
-            phase = tf.atan2(phase_sin, phase_cos)
+            phase_analytic = self.reconstruct_phase(coeffs, zernike_basis, laser_mask)
+            phase_residual = tf.atan2(phase_sin, phase_cos)
+            phase = phase_analytic + phase_residual
             phases.append(phase)
         
-        coefficients = []
-        for i in range(self.num_lasers):
-            # Pool features weighted by attention
-            laser_mask = attention_maps[..., i:i+1]
-            masked_zernike = zernike_raw * laser_mask
-            z_global = self.global_pool(masked_zernike)
-            coeffs = self.coeff_predictors[i](z_global, training=training)
-            coefficients.append(coeffs)
-        
-        return phases, coefficients, attention_maps
+        return phases, attention_maps
 
-if __name__ == "__main__":
+if __name__ == "not __main__":
     dist = np.float64(384000000)
     target = [0, 0, dist]
     john_array = ArrayDesign(2, 'hex')
-    john_perturbation = BeamPerturbator(target, john_array, Ideal = True, fried_mult = 1.0)
+    john_perturbation = BeamPerturbator(target, john_array, Ideal = False, fried_mult = 64.0)
     e_field, x_in, y_in = john_perturbation.input_e_field()
     e_field_ff, x_out, y_out = john_perturbation.fresnel_propagation(e_field, dist)
     I_field = np.abs(e_field) ** 2
@@ -690,7 +708,7 @@ if __name__ == "__main__":
     plt.savefig(f'{out_dir}/intensity_plots_{timestamp}.png', dpi=300, bbox_inches='tight')
     plt.close(fig)
 
-if __name__ == "not __main__":
+if __name__ == "__main__":
     cnn = FFPhaseCNN()
     dummy_input = tf.random.normal((1, 256, 256, 1))
     _ = cnn(dummy_input)
