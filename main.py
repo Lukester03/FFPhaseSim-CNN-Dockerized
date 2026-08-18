@@ -9,16 +9,19 @@ import matplotlib
 matplotlib.use('Agg')
 
 from datetime import datetime
+import h5py
 import numpy as np
+import pandas as pd
+from pathlib import Path
 import math
 import random
 import tensorflow as tf
 import soapy
 from keras import layers, Model
 import matplotlib.pyplot as plt
+from scipy.linalg import hadamard
 from scipy.signal import CZT
-from numpy.fft import fft2, ifft2, fftshift, ifftshift
-
+from numpy.fft import fft2, ifft2
 
 class ArrayDesign:
     def __init__(self, side: int, shape: str):
@@ -552,17 +555,27 @@ class FiLMConditioner(layers.Layer):
         return features * (1 + gamma) + beta
 
 class FFPhaseCNN(Model):
-    def __init__(self, input_grid: list = [256, 256, 1], mode_count=36, 
+    def __init__(self, grid_width = 256, mode_count=36, 
         gabor_kernel_size = 15, gabor_orientations = 8, gabor_lmbda = None, laser_count = 7,
-        element_positions = [], processor_channels = [64, 64, 32], **kwargs):
+        element_positions = None, processor_channels = [64, 64, 32], **kwargs):
         super().__init__(**kwargs)
-        self.input_grid = input_grid
         self.num_modes = mode_count
         self.gabor_kern_size = gabor_kernel_size
         self.gabor_orientations = gabor_orientations
         self.gabor_lmbda = gabor_lmbda
         self.num_lasers = laser_count
+        if element_positions == None:
+            element_positions = [[-0.8660254, -0.5, 0.],
+                                 [-0.8660254, 0.5, 0.],
+                                 [ 0., -1., 0.],
+                                 [ 0., 0., 0.],
+                                 [ 0., 1., 0.],
+                                 [ 0.8660254, -0.5, 0.],
+                                 [ 0.8660254, 0.5, 0.]]
         self.element_positions = np.asarray(element_positions)
+
+        # Zernike Basis for reconstructing phase
+        self.zernike_basis = ZernikeFilterBank(grid_width, self.num_modes).generate_filter_bank()
         
         # Non-trainable filter layers:
         
@@ -619,26 +632,24 @@ class FFPhaseCNN(Model):
             layers.Conv2D(2, 3, padding='SAME'),
         ], name='shared_decoder')
 
-        self.film = FiLMConditioner(sum(processor_channels)+1)
-        self.global_pool = layers.GlobalAveragePooling2D()
-
-    def reconstruct_phase(self, coeffs, zernike_basis, aperture_mask):
-        phase = tf.einsum('bm,hwm->bhw', coeffs, zernike_basis)
-        return phase[..., None] * aperture_mask
-    
-    def call(self, inputs, training = False):
-        zernike_raw = self.zernike_conv(inputs)  # [B, H, W, 36]
-        gabor_raw = self.gabor_conv(inputs)      # [B, H, W, 80]
         # coefficients
         self.coeff_head = tf.keras.Sequential([
             layers.Dense (64, activation='relu'),
             layers.Dense(self.num_modes),
         ], name = 'coeff_head')
-        pooled = self.global_pool(conditioned)
-        coeffs = self.coeff_head(pooled)
 
-        # Zernike Basis for reconstructing phase
-        zernike_basis = ZernikeFilterBank(256).generate_filter_bank()
+        self.film = FiLMConditioner(sum(processor_channels))
+        self.global_pool = layers.GlobalAveragePooling2D()
+
+    def reconstruct_phase(self, coeffs, zernike_basis, aperture_mask):
+
+        print(coeffs.shape,zernike_basis.shape,aperture_mask.shape)
+        phase = tf.einsum('bm,hwlm->bhw', coeffs, zernike_basis)
+        return phase[..., None] * aperture_mask
+    
+    def call(self, inputs, training = False):
+        zernike_raw = self.zernike_conv(inputs)  # [B, H, W, 36]
+        gabor_raw = self.gabor_conv(inputs)      # [B, H, W, 80]
 
         # Features processing
         z_features = self.zernike_processor(zernike_raw, training=training)
@@ -659,15 +670,147 @@ class FFPhaseCNN(Model):
             pos = tf.constant([[self.element_positions[i,0], self.element_positions[i,1]]], dtype=tf.float32)
             pos = tf.tile(pos, [tf.shape(inputs)[0], 1])
             conditioned = self.film(laser_features, pos)
+            pooled = self.global_pool(conditioned)
+            coeffs = self.coeff_head(pooled)
             phase_components = self.shared_decoder(conditioned, training=training)
             phase_sin = phase_components[..., 0:1]
             phase_cos = phase_components[..., 1:2]
-            phase_analytic = self.reconstruct_phase(coeffs, zernike_basis, laser_mask)
+            phase_analytic = self.reconstruct_phase(coeffs, self.zernike_basis, laser_mask)
             phase_residual = tf.atan2(phase_sin, phase_cos)
             phase = phase_analytic + phase_residual
             phases.append(phase)
         
         return phases, attention_maps
+
+class SPGDOptimizer:
+    def __init__(self, OpticalSimulator: BeamPerturbator, momentum=0):
+        # constants
+        self.fine_phase = 4096
+        self.pert_strength = 0.1
+        self.momentum = momentum
+        # optical components
+        self.optsim = OpticalSimulator
+        self.dist = self.optsim.target_position[2]
+        self.params = self.optsim.chan_rel_phases * self.fine_phase
+        self.chan_count = self.params.shape[0]
+        self.velocity = np.zeros_like(self.params)
+        # state tracking
+        self.iteration = 0
+        self.best_params = None
+        self.best_intensity = 0
+        # hadamard matrix dither
+        self.hadamard_order = math.ceil(np.log2(self.chan_count))
+        self.hadamard_matrix = hadamard(2**self.hadamard_order)
+        self.hadamard_count = 0
+
+    def generate_perturbation(self):
+        pos_pert = self.params.copy()
+        neg_pert = self.params.copy()
+        pert_vect = np.zeros_like(pos_pert)
+        for chan in range(self.chan_count):
+            step = self.fine_phase * self.hadamard_matrix[chan, self.hadamard_count % len(self.hadamard_matrix)] * self.pert_strength
+            pos_pert[chan] = (pos_pert[chan] + step) % self.fine_phase
+            neg_pert[chan] = (neg_pert[chan] - step) % self.fine_phase
+            pert_vect[chan] += step
+        self.hadamard_count += 1
+        if self.hadamard_count > 2**self.hadamard_order:
+            self.hadamard_count = 0
+        return pos_pert, neg_pert, pert_vect
+        
+    def gradient_estimation(self, pos_pert, neg_pert, pert_array):
+        fine_to_phase = (2 * np.pi) / self.fine_phase
+        #evaluating intensities
+        self.optsim.chan_rel_phases = pos_pert * fine_to_phase
+        input_e_pos, _, _ = self.optsim.input_e_field()
+        e_field_pos, _, _ = self.optsim.fresnel_propagation(input_e_pos, self.dist)
+        pos_intensity = np.max(np.abs(e_field_pos)) ** 2
+
+        self.optsim.chan_rel_phases = neg_pert * fine_to_phase
+        input_e_neg, _, _ = self.optsim.input_e_field()
+        e_field_neg, _, _ = self.optsim.fresnel_propagation(input_e_neg, self.dist)
+        neg_intensity = np.max(np.abs(e_field_neg)) ** 2
+        # computing gradient
+        intensity_diff = pos_intensity - neg_intensity
+        gradient = intensity_diff * pert_array
+        return gradient, pos_intensity, neg_intensity
+
+    def opt_step(self):
+        pos_step, neg_step, pert = self.generate_perturbation()
+        grad, _, _ = self.gradient_estimation(pos_step, neg_step, pert)
+        self.velocity = self.momentum * self.velocity + grad * (1-self.momentum)
+        nextparams = self.params + self.velocity
+        for i in range(len(nextparams)):
+            nextparams[i] %= self.fine_phase
+        self.params = nextparams
+        self.optsim.chan_rel_phases = self.params
+        input_e, _, _ = self.optsim.input_e_field()
+        e_field_c = self.optsim.fresnel_propagation(input_e, self.dist)
+        current_intensity = np.max(np.abs(e_field_c)) ** 2
+        if current_intensity > self.best_intensity:
+            self.best_intensity = current_intensity
+            self.best_params = self.params.copy()
+        self.iteration += 1
+        return current_intensity
+
+    def optimization(self, iterations, verbose = True, verbose_frequency=10):
+        for n in range(iterations):
+            current_intensity = self.opt_step()
+            if verbose and n % verbose_frequency == 0:
+                print(f"Iteration {n:4d}: Intensity = {current_intensity:.4e},"
+                      f"Best Intensity = {self.best_intensity:.4e}")
+        if verbose:
+            print(f"\nOptimization Complete. Best Intensity Reached: {self.best_intensity:.4e}")
+        return self.best_params
+
+    def reset(self, new_params):
+        if new_params is not None:
+            self.params = new_params
+        self.velocity = np.zeros_like(self.params)
+        self.iteration = self.best_intensity = self.hadamard_count = 0
+        self.best_params = None
+        self.chan_count = self.optsim.chan_rel_phases.shape[0]
+        self.hadamard_order = math.ceil(np.log2(self.chan_count))
+        self.hadamard_matrix = hadamard(2**self.hadamard_order)
+
+class DatasetStore:
+    def __init__(self, h5_path, image_shape, num_channels):
+        self.h5_path = Path(h5_path)
+        self.catalog_path = self.h5_path.with_suffix('.catalog.csv')
+        self.image_shape = image_shape
+        self.num_channels = num_channels
+        self._catalog_rows = []
+        self._n = 0
+
+        self.f = h5py.File(self.h5_path, 'a')
+        if 'images' not in self.f:
+            self.f.create_dataset('images', shape=(0, *image_shape), maxshape=(None, *image_shape),
+                                   dtype='float32', chunks=(1, *image_shape), compression='gzip')
+            self.f.create_dataset('labels', shape=(0, num_channels), maxshape=(None, num_channels),
+                                   dtype='float32')
+        self._n = self.f['images'].shape[0]
+
+    def add_example(self, image, label_rad, **metadata):
+        n = self._n
+        for ds_name, arr in [('images', image), ('labels', label_rad)]:
+            ds = self.f[ds_name]
+            ds.resize(n + 1, axis=0)
+            ds[n] = arr
+        row = {'index':n, **metadata}
+        self._catalog_rows.append(row)
+        self._n += 1
+        if self._n % 50 == 0:
+            self.flush()
+
+    def flush(self):
+        self.f.flush()
+        pd.DataFrame(self._catalog_rows).to_csv(
+            self.catalog_path, mode='a', header = not self.catalog_path.exists(), index=False
+        )
+        self._catalog_rows = []
+
+    def close(self):
+        self.flush()
+        self.f.close()
 
 if __name__ == "not __main__":
     dist = np.float64(384000000)
@@ -709,6 +852,8 @@ if __name__ == "not __main__":
     plt.close(fig)
 
 if __name__ == "__main__":
+    pee = ArrayDesign(2,"hex")
+    print(pee.arrayvector)
     cnn = FFPhaseCNN()
     dummy_input = tf.random.normal((1, 256, 256, 1))
     _ = cnn(dummy_input)
