@@ -55,7 +55,8 @@ class ArrayDesign:
 
 class TurbulenceModeler:
     def __init__(self, wavelength: float = 1064e-9, 
-    outer_scale: float = np.inf, grid_size: int = 2048, screen_physical_size: float = 2.0, grnd_speed = 5.0, fried_mult = 1.0):
+    outer_scale: float = np.inf, grid_size: int = 1024, screen_physical_size: float = 2.0, grnd_speed = 5.0, fried_mult = 1.0):
+        self.r0_check = False
         self.phase_catalog = None
         self.fried_mult = fried_mult
         self.wavelen = wavelength
@@ -81,11 +82,9 @@ class TurbulenceModeler:
         r0 = (0.423 * 0.5 * struct_fxn_integral * k_wavenum ** 2) ** (-3/5) * self.fried_mult
         return r0
 
-    def phase_screen_gen(self, height1, height2, random_seed = None, b_val = None):
+    def phase_screen_gen(self, height1, height2, b_val = None):
         if b_val == None:
             b_val = 1
-        if random_seed == None:
-            random_seed = random.randint(0,100000)
         r0 = self.hv_fried_param(height1, height2, b_val)
         phase_screens = soapy.atmosphere.makePhaseScreens(
             nScrns=1,
@@ -100,31 +99,31 @@ class TurbulenceModeler:
 
         return phase_screens[0], r0
 
-    def all_screen_gen(self, random_seed = None, 
-        b_val = None, gen_height = 20000):
+    def all_screen_gen(self, b_val = None, gen_height = 20000):
         r0_total = 0
         screen_count = 32
         nx = self.grid_size
         self.phase_catalog = np.zeros((screen_count, nx, nx))
         screen_heights = np.linspace(0, gen_height, num = (screen_count+1))
         for i in range(screen_count):
-            phase_screen, r0 = self.phase_screen_gen(random_seed = 
-            random_seed, b_val = b_val, height1 = screen_heights[i], 
+            phase_screen, r0 = self.phase_screen_gen(b_val = b_val, height1 = screen_heights[i], 
             height2 = screen_heights[i+1])
             r0_total += r0 ** (-5/3)
             self.phase_catalog[i] = phase_screen
-        print(r0_total ** -3/5)
+        if self.r0_check is False:
+            print(r0_total)
+            self.r0_check = True
 
 class BeamPerturbator:
-    def __init__(self, targ_pos: list, array_des: ArrayDesign, grid_length: np.float64 = 1024, Ideal = True, fried_mult = 1.0):
+    def __init__(self, ssl, targ_pos: list, array_des: ArrayDesign, grid_length: np.float64 = 1024, Ideal = True, fried_mult = 1.0):
         self.waist = self.apert_radi = self.wavelength = self.spatial_samp_length = np.float64(0)
-        self.chan_amps = self.turb_model = self.phase_screens = self.apply_turb = None
+        self.chan_amps = self.turb_model = self.base_fields = self.phase_screens = self.apply_turb = self.h_layers = None
         self.target_position = targ_pos
         self.rel_array = array_des
         self.grid_length = grid_length
         self.set_rel_phases()
         self.chan_rel_phases = np.zeros(self.rel_array.arrayvector.shape[0])
-        self.set_beam_elements(ideal = Ideal, fried_mult = fried_mult)
+        self.set_beam_elements(ideal = Ideal, fried_mult = fried_mult, ssl = ssl)
 
     def set_beam_elements(self,
                           clip_ratio: np.float64 = 0.6,
@@ -136,6 +135,7 @@ class BeamPerturbator:
                           gaussian: bool = True,
                           fried_mult = 1.0):
         self.chan_amps = np.full(self.rel_array.arrayvector.shape[0], init_amp)
+        self.base_fields = []
         self.waist = apert_radi * clip_ratio
         self.apert_radi = apert_radi
         self.wavelength = wavelength
@@ -148,18 +148,32 @@ class BeamPerturbator:
 
         #initializing turbulence module ONLY if non-ideal prop
         self.phase_screens = None
+        self.h_layers = []
         self.apply_turb = not ideal
         if not ideal:
             self.turb_model = TurbulenceModeler(wavelength = wavelength, grid_size = self.grid_length, fried_mult=fried_mult)
             self.generate_turbulence()
+            self.generate_transfer()
         
-    def generate_turbulence(self, b_val = 1, random_seed = None):
-        self.turb_model.all_screen_gen(
-        random_seed = random_seed, 
-        b_val = b_val)
+    def generate_turbulence(self, b_val = 1):
+        self.turb_model.all_screen_gen(b_val = b_val)
         self.phase_screens = self.turb_model.phase_catalog.copy()
-        
-        
+
+    def generate_transfer(self):
+        dim = self.grid_length
+        fx = np.fft.fftfreq(dim, d=self.spatial_samp_length)
+        fy = np.fft.fftfreq(dim, d=self.spatial_samp_length)
+        FX, FY = np.meshgrid(fx, fy)
+        k = 2*np.pi/self.wavelength
+        screen_heights = np.linspace(0, min(self.target_position[2], 20000), num=len(self.phase_screens)+1)
+        self.h_layers = []
+        z_current = 0.0
+        for h in screen_heights[1:]:
+            dz = h - z_current
+            H = np.exp(1j * k * dz) * np.exp(-1j * np.pi * self.wavelength * dz * (FX ** 2 + FY ** 2))
+            self.h_layers.append(H)
+            z_current = h
+
     def set_rel_phases(self,
                        rel_phases=None):
         if rel_phases is not None:
@@ -167,7 +181,8 @@ class BeamPerturbator:
         else:
             self.chan_rel_phases = np.zeros(self.rel_array.arrayvector.shape[0])
 
-    def input_e_field(self):
+    def input_e_field_base(self):
+        self.base_fields = []
         # relevant constants
         k = 2 * np.pi / self.wavelength
         ssl = self.spatial_samp_length
@@ -179,12 +194,9 @@ class BeamPerturbator:
         x = (np.arange(dim_x) - dim_x / 2) * ssl
         y = (np.arange(dim_y) - dim_y / 2) * ssl
         X, Y = np.meshgrid(x, y)
-        input_e = np.zeros([dim_y, dim_x], dtype=np.complex128)
-
         x_f, y_f, z_f = self.target_position
         x_n = pos_apert[:, 0]
         y_n = pos_apert[:, 1]
-
         # vectorized steering phases
         dx = x_f - x_n
         dy = y_f - y_n
@@ -192,7 +204,6 @@ class BeamPerturbator:
         sin_theta_x = dx / R_target
         sin_theta_y = dy / R_target
         piston = -k * R_target
-
         # summing over contributions from each aperture
         for n in range(num_apertures):
             X_local = X - x_n[n]
@@ -204,9 +215,15 @@ class BeamPerturbator:
             else:
                 amp_prof = aperture
             phi_steer = k * (sin_theta_x[n] * X_local + sin_theta_y[n] * Y_local)
-            total_phase = phi_steer + piston[n] + self.chan_rel_phases[n]
-            input_e += amp_prof * self.chan_amps[n] * np.exp(1j * total_phase)
-        return input_e, x, y
+            total_phase = phi_steer + piston[n]
+            self.base_fields.append(amp_prof * self.chan_amps[n] * np.exp(1j * total_phase))
+        return x, y
+
+    def input_e_quick(self):
+        input_e = np.zeros_like(self.base_fields[0], dtype=np.complex128)
+        for n, base in enumerate(self.base_fields):
+            input_e += base * np.exp(1j * self.chan_rel_phases[n])
+        return input_e
 
     def fresnel_czt(self, input_field, z: np.float64, k):
         dim_y, dim_x = input_field.shape
@@ -218,7 +235,7 @@ class BeamPerturbator:
         array_extent = (self.element_positions[:,0].max() - self.element_positions[:,0].min())
         d_array = array_extent + 2 * self.apert_radi
         diff_limited_spot = self.wavelength * z / d_array
-        out_window = 30 * diff_limited_spot
+        out_window = 20 * diff_limited_spot
         E_mod = input_field * Q1
         out_size = self.grid_length
         out_center = [0,0]
@@ -243,23 +260,15 @@ class BeamPerturbator:
         ssl = self.spatial_samp_length
         k = 2 * np.pi / self.wavelength
         if self.apply_turb:
-            fx = np.fft.fftfreq(dim_x, d=ssl)
-            fy = np.fft.fftfreq(dim_y, d=ssl)
-            FX, FY = np.meshgrid(fx,fy)
-
             z_atmo = min(z, 20000)
             screen_num = min(len(self.phase_screens), int(round(z/500)))
             field = input_field.copy()
             screen_heights = np.linspace(0, z_atmo, num = screen_num + 1)
             z_current = 0.0
             for n in range(screen_num):
-                altitude = screen_heights[n+1]
-                dz = altitude - z_current
-                if dz > 0:
-                    H = np.exp(1j * k * dz) * np.exp(-1j * np.pi * self.wavelength * dz * (FX ** 2 + FY ** 2))
-                    field = ifft2(fft2(field) * H)
+                z_current = screen_heights[n+1]
+                field = ifft2(fft2(field) * self.h_layers[n])
                 field *= np.exp(1j * self.phase_screens[n])
-                z_current = altitude
             dist_remainder = z-z_current
             if dist_remainder > 0:
                 return self.fresnel_czt(input_field = field, z = dist_remainder, k = k)
@@ -642,8 +651,6 @@ class FFPhaseCNN(Model):
         self.global_pool = layers.GlobalAveragePooling2D()
 
     def reconstruct_phase(self, coeffs, zernike_basis, aperture_mask):
-
-        print(coeffs.shape,zernike_basis.shape,aperture_mask.shape)
         phase = tf.einsum('bm,hwlm->bhw', coeffs, zernike_basis)
         return phase[..., None] * aperture_mask
     
@@ -688,6 +695,7 @@ class SPGDOptimizer:
         self.fine_phase = 4096
         self.pert_strength = 0.1
         self.momentum = momentum
+        self.fine_to_phase = (2 * np.pi) / self.fine_phase
         # optical components
         self.optsim = OpticalSimulator
         self.dist = self.optsim.target_position[2]
@@ -702,6 +710,9 @@ class SPGDOptimizer:
         self.hadamard_order = math.ceil(np.log2(self.chan_count))
         self.hadamard_matrix = hadamard(2**self.hadamard_order)
         self.hadamard_count = 0
+        # intensity normalization
+        self.intensity_check = False
+        self.intensity_scale = 1
 
     def generate_perturbation(self):
         pos_pert = self.params.copy()
@@ -718,17 +729,23 @@ class SPGDOptimizer:
         return pos_pert, neg_pert, pert_vect
         
     def gradient_estimation(self, pos_pert, neg_pert, pert_array):
-        fine_to_phase = (2 * np.pi) / self.fine_phase
         #evaluating intensities
-        self.optsim.chan_rel_phases = pos_pert * fine_to_phase
-        input_e_pos, _, _ = self.optsim.input_e_field()
+        _ , _ = self.optsim.input_e_field_base()
+        self.optsim.set_rel_phases(pos_pert * self.fine_to_phase)
+        input_e_pos = self.optsim.input_e_quick()
         e_field_pos, _, _ = self.optsim.fresnel_propagation(input_e_pos, self.dist)
         pos_intensity = np.max(np.abs(e_field_pos)) ** 2
 
-        self.optsim.chan_rel_phases = neg_pert * fine_to_phase
-        input_e_neg, _, _ = self.optsim.input_e_field()
+        self.optsim.set_rel_phases(neg_pert * self.fine_to_phase)
+        input_e_neg = self.optsim.input_e_quick()
         e_field_neg, _, _ = self.optsim.fresnel_propagation(input_e_neg, self.dist)
         neg_intensity = np.max(np.abs(e_field_neg)) ** 2
+        # scaling intensity
+        if self.intensity_check is False:
+            self.intensity_scale = (pos_intensity + neg_intensity) / 2
+            self.intensity_check = True
+        else:
+            self.intensity_scale = (0.99 * self.intensity_scale + 0.01 * (pos_intensity + neg_intensity) / 2)
         # computing gradient
         intensity_diff = pos_intensity - neg_intensity
         gradient = intensity_diff * pert_array
@@ -736,19 +753,18 @@ class SPGDOptimizer:
 
     def opt_step(self):
         pos_step, neg_step, pert = self.generate_perturbation()
-        grad, _, _ = self.gradient_estimation(pos_step, neg_step, pert)
+        grad, pos_inten, neg_inten = self.gradient_estimation(pos_step, neg_step, pert)
+        grad /= self.intensity_scale
         self.velocity = self.momentum * self.velocity + grad * (1-self.momentum)
         nextparams = self.params + self.velocity
         for i in range(len(nextparams)):
             nextparams[i] %= self.fine_phase
         self.params = nextparams
-        self.optsim.chan_rel_phases = self.params
-        input_e, _, _ = self.optsim.input_e_field()
-        e_field_c = self.optsim.fresnel_propagation(input_e, self.dist)
-        current_intensity = np.max(np.abs(e_field_c)) ** 2
+        self.optsim.set_rel_phases(self.params * self.fine_to_phase)
+        current_intensity = np.average([pos_inten, neg_inten])
         if current_intensity > self.best_intensity:
             self.best_intensity = current_intensity
-            self.best_params = self.params.copy()
+            self.best_params = self.params.copy() * self.fine_to_phase
         self.iteration += 1
         return current_intensity
 
@@ -768,6 +784,8 @@ class SPGDOptimizer:
         self.velocity = np.zeros_like(self.params)
         self.iteration = self.best_intensity = self.hadamard_count = 0
         self.best_params = None
+        self.intensity_check = False
+        self.intensity_scale = 1
         self.chan_count = self.optsim.chan_rel_phases.shape[0]
         self.hadamard_order = math.ceil(np.log2(self.chan_count))
         self.hadamard_matrix = hadamard(2**self.hadamard_order)
@@ -798,7 +816,7 @@ class DatasetStore:
         row = {'index':n, **metadata}
         self._catalog_rows.append(row)
         self._n += 1
-        if self._n % 50 == 0:
+        if self._n % 16 == 0:
             self.flush()
 
     def flush(self):
@@ -812,12 +830,38 @@ class DatasetStore:
         self.flush()
         self.f.close()
 
+#testing data generation
+if __name__ == "__main__":
+    writer = DatasetStore('testtrainingdata.h5', image_shape = (256,256), num_channels = 7)
+    dist = 384000000
+    target = [0, 0, dist]
+    array = ArrayDesign(2, 'hex')
+    sim = BeamPerturbator(ssl = 1.6e-3, targ_pos = target, array_des = array, fried_mult = 64, Ideal=False, grid_length=256)
+    x, y = sim.input_e_field_base()
+    for real in range(16):
+        if real != 0:
+            sim.generate_turbulence()
+        input = sim.input_e_quick()
+        sim.set_rel_phases()
+        init_image, _, _ = sim.fresnel_propagation(input, dist)
+        spgd = SPGDOptimizer(sim, 0.5)
+        best_params = spgd.optimization(iterations = 100, verbose = False)
+        writer.add_example(init_image.astype('float32'), best_params.astype('float32'),
+                           fried_mult = 64, best_intensity = spgd.best_intensity, 
+                           iterations = spgd.iteration, target_x = target[0], 
+                           target_y = target[1])
+        print(real + 1)
+    writer.close()
+
+# optical simulator test 
 if __name__ == "not __main__":
     dist = np.float64(384000000)
     target = [0, 0, dist]
     john_array = ArrayDesign(2, 'hex')
-    john_perturbation = BeamPerturbator(target, john_array, Ideal = False, fried_mult = 64.0)
-    e_field, x_in, y_in = john_perturbation.input_e_field()
+    john_perturbation = BeamPerturbator(ssl = 1.6e-3, targ_pos = target, array_des = john_array, Ideal = True, fried_mult = 64.0, grid_length = 256)
+    x_in, y_in = john_perturbation.input_e_field_base()
+    john_perturbation.set_rel_phases()
+    e_field = john_perturbation.input_e_quick()
     e_field_ff, x_out, y_out = john_perturbation.fresnel_propagation(e_field, dist)
     I_field = np.abs(e_field) ** 2
     I_field_ff = np.abs(e_field_ff) ** 2
@@ -851,10 +895,10 @@ if __name__ == "not __main__":
     plt.savefig(f'{out_dir}/intensity_plots_{timestamp}.png', dpi=300, bbox_inches='tight')
     plt.close(fig)
 
-if __name__ == "__main__":
-    pee = ArrayDesign(2,"hex")
-    print(pee.arrayvector)
+#CNN test
+if __name__ == "not __main__":
     cnn = FFPhaseCNN()
     dummy_input = tf.random.normal((1, 256, 256, 1))
     _ = cnn(dummy_input)
     cnn.summary()
+
