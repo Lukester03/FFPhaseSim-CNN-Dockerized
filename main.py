@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 import math
-import random
+import time
 import tensorflow as tf
 import soapy
 from keras import layers, Model
@@ -22,6 +22,16 @@ import matplotlib.pyplot as plt
 from scipy.linalg import hadamard
 from scipy.signal import CZT
 from numpy.fft import fft2, ifft2
+
+class timer_class:
+    def __init__(self):
+        self.start_time = time.monotonic()
+    def elapsed(self):
+        return time.monotonic() - self.start_time
+    def reset(self):
+        self.start_time = time.monotonic()
+
+Timer = timer_class()
 
 class ArrayDesign:
     def __init__(self, side: int, shape: str):
@@ -117,7 +127,8 @@ class TurbulenceModeler:
 class BeamPerturbator:
     def __init__(self, ssl, targ_pos: list, array_des: ArrayDesign, grid_length: np.float64 = 1024, Ideal = True, fried_mult = 1.0):
         self.waist = self.apert_radi = self.wavelength = self.spatial_samp_length = np.float64(0)
-        self.chan_amps = self.turb_model = self.base_fields = self.phase_screens = self.apply_turb = self.h_layers = None
+        self.chan_amps = self.turb_model = self.base_fields = None
+        self.phase_screens = self.apply_turb = self.h_layers = None
         self.target_position = targ_pos
         self.rel_array = array_des
         self.grid_length = grid_length
@@ -151,7 +162,8 @@ class BeamPerturbator:
         self.h_layers = []
         self.apply_turb = not ideal
         if not ideal:
-            self.turb_model = TurbulenceModeler(wavelength = wavelength, grid_size = self.grid_length, fried_mult=fried_mult)
+            self.turb_model = TurbulenceModeler(wavelength = wavelength, grid_size = self.grid_length,
+                                                fried_mult=fried_mult)
             self.generate_turbulence()
             self.generate_transfer()
         
@@ -693,7 +705,8 @@ class SPGDOptimizer:
     def __init__(self, OpticalSimulator: BeamPerturbator, momentum=0):
         # constants
         self.fine_phase = 4096
-        self.pert_strength = 0.1
+        self.pert_strength = 0.05
+        self.gain = 0.35
         self.momentum = momentum
         self.fine_to_phase = (2 * np.pi) / self.fine_phase
         # optical components
@@ -745,7 +758,8 @@ class SPGDOptimizer:
             self.intensity_scale = (pos_intensity + neg_intensity) / 2
             self.intensity_check = True
         else:
-            self.intensity_scale = (0.99 * self.intensity_scale + 0.01 * (pos_intensity + neg_intensity) / 2)
+            self.intensity_scale = (0.95 * self.intensity_scale + 
+                                    0.05 * (pos_intensity + neg_intensity) / 2)
         # computing gradient
         intensity_diff = pos_intensity - neg_intensity
         gradient = intensity_diff * pert_array
@@ -755,7 +769,7 @@ class SPGDOptimizer:
         pos_step, neg_step, pert = self.generate_perturbation()
         grad, pos_inten, neg_inten = self.gradient_estimation(pos_step, neg_step, pert)
         grad /= self.intensity_scale
-        self.velocity = self.momentum * self.velocity + grad * (1-self.momentum)
+        self.velocity = self.momentum * self.velocity + (grad * self.gain) * (1-self.momentum)
         nextparams = self.params + self.velocity
         for i in range(len(nextparams)):
             nextparams[i] %= self.fine_phase
@@ -791,11 +805,12 @@ class SPGDOptimizer:
         self.hadamard_matrix = hadamard(2**self.hadamard_order)
 
 class DatasetStore:
-    def __init__(self, h5_path, image_shape, num_channels):
+    def __init__(self, h5_path, image_shape, num_channels, flush_count = 16):
         self.h5_path = Path(h5_path)
         self.catalog_path = self.h5_path.with_suffix('.catalog.csv')
         self.image_shape = image_shape
         self.num_channels = num_channels
+        self.flush_count = flush_count
         self._catalog_rows = []
         self._n = 0
 
@@ -803,20 +818,22 @@ class DatasetStore:
         if 'images' not in self.f:
             self.f.create_dataset('images', shape=(0, *image_shape), maxshape=(None, *image_shape),
                                    dtype='float32', chunks=(1, *image_shape), compression='gzip')
+            self.f.create_dataset('opt_images', shape=(0, *image_shape), maxshape=(None, *image_shape),
+                                   dtype='float32', chunks=(1, *image_shape), compression='gzip')
             self.f.create_dataset('labels', shape=(0, num_channels), maxshape=(None, num_channels),
                                    dtype='float32')
         self._n = self.f['images'].shape[0]
 
-    def add_example(self, image, label_rad, **metadata):
+    def add_example(self, image, opt_image, label_rad, **metadata):
         n = self._n
-        for ds_name, arr in [('images', image), ('labels', label_rad)]:
+        for ds_name, arr in [('images', image), ('opt_images', opt_image), ('labels', label_rad)]:
             ds = self.f[ds_name]
             ds.resize(n + 1, axis=0)
             ds[n] = arr
         row = {'index':n, **metadata}
         self._catalog_rows.append(row)
         self._n += 1
-        if self._n % 16 == 0:
+        if self._n % self.flush_count == 0:
             self.flush()
 
     def flush(self):
@@ -830,35 +847,88 @@ class DatasetStore:
         self.flush()
         self.f.close()
 
-#testing data generation
 if __name__ == "__main__":
-    writer = DatasetStore('testtrainingdata.h5', image_shape = (256,256), num_channels = 7)
+    print(f"Time to import: {Timer.elapsed()}")
+    choice = input("What test are you running?\n -h5 \n -train \n -optsim \n -cnn \n")
+
+#looking at testing data
+if choice == "h5":
+    example_num = int(input("What example do you want to view? \n"))
+    filename = "testtrainingdata.h5"
+    h5_path = Path(filename)
+    catalog_path = h5_path.with_suffix('.catalog.csv')
+    with h5py.File(h5_path, 'r') as f:
+        image = f['images'][example_num]
+        opt_image = f['opt_images'][example_num]
+        label = f['labels'][example_num]
+    catalog = pd.read_csv(catalog_path)
+    row = catalog[catalog['index'] == example_num].iloc[0]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12,5))
+
+    im1 = ax1.imshow(image, cmap='plasma', origin='lower')
+    ax1.set_title(f"Example {example_num} — Pre-Optimization")
+    plt.colorbar(im1, ax=ax1, label='Intensity')
+
+    im2 = ax2.imshow(opt_image, cmap='plasma', origin='lower')
+    ax2.set_title(f"Example {example_num} — Post-Optimization")
+    plt.colorbar(im2, ax=ax2, label='Intensity')
+
+    print(f"index:          {example_num}")
+    print(f"label (params): {list(map(lambda x: f'{x:.2e}', label))}")
+    print(f"fried_mult:     {row['fried_mult']}")
+    print(f"init_intensity: {row['init_intensity']:.2e}")
+    print(f"best_intensity: {row['best_intensity']:.2e}")
+    print(f"iterations:     {row['iterations']}")
+    print(f"target:         ({row['target_x']}, {row['target_y']})")
+    plt.tight_layout()
+    plt.savefig(f'outputs/example_{example_num}.png', dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+#testing data generation
+if choice == "train":
+    grid_data_size = int(input("How long should the grid be?\n"))
+    grid_ssl = int(input("How large should sampling be?(0.1mm)\n"))
+    real_count = int(input("How many realizations do you want to generate?\n"))
+    writer = DatasetStore('testtrainingdata.h5', image_shape = (grid_data_size,grid_data_size), 
+                          num_channels = 7, flush_count=real_count)
     dist = 384000000
     target = [0, 0, dist]
     array = ArrayDesign(2, 'hex')
-    sim = BeamPerturbator(ssl = 1.6e-3, targ_pos = target, array_des = array, fried_mult = 64, Ideal=False, grid_length=256)
+    sim = BeamPerturbator(ssl = grid_ssl*1e-4, targ_pos = target, array_des = array, 
+                          fried_mult = 64, Ideal=False, grid_length = grid_data_size)
     x, y = sim.input_e_field_base()
-    for real in range(16):
+    for real in range(real_count):
         if real != 0:
             sim.generate_turbulence()
-        input = sim.input_e_quick()
         sim.set_rel_phases()
-        init_image, _, _ = sim.fresnel_propagation(input, dist)
+        input = sim.input_e_quick()
+        init_e_image, x_def, y_def = sim.fresnel_propagation(input, dist)
+        init_image = np.abs(init_e_image) ** 2
+        init_intensity = np.max(init_image)
+
         spgd = SPGDOptimizer(sim, 0.5)
-        best_params = spgd.optimization(iterations = 100, verbose = False)
-        writer.add_example(init_image.astype('float32'), best_params.astype('float32'),
-                           fried_mult = 64, best_intensity = spgd.best_intensity, 
+        best_params = spgd.optimization(iterations = 200, verbose = False)
+
+        sim.set_rel_phases(best_params)
+        opt_input = sim.input_e_quick()
+        opt_e_image, _, _ = sim.fresnel_propagation(opt_input, dist)
+        opt_image = np.abs(opt_e_image)**2
+
+        writer.add_example(init_image.astype('float32'), opt_image.astype('float32'), 
+                           best_params.astype('float32'), fried_mult = 64, 
+                           init_intensity = init_intensity, best_intensity = spgd.best_intensity, 
                            iterations = spgd.iteration, target_x = target[0], 
-                           target_y = target[1])
-        print(real + 1)
+                           target_y = target[1], x_def = x_def, y_def = y_def)
+        print(f"Realization #{real+1} generated. Time elapsed: {Timer.elapsed():.2f}")
     writer.close()
 
 # optical simulator test 
-if __name__ == "not __main__":
+if choice == "optsim":
     dist = np.float64(384000000)
     target = [0, 0, dist]
     john_array = ArrayDesign(2, 'hex')
-    john_perturbation = BeamPerturbator(ssl = 1.6e-3, targ_pos = target, array_des = john_array, Ideal = True, fried_mult = 64.0, grid_length = 256)
+    john_perturbation = BeamPerturbator(ssl = 16e-4, targ_pos = target, array_des = john_array, 
+                                        Ideal = True, fried_mult = 64.0, grid_length = 256)
     x_in, y_in = john_perturbation.input_e_field_base()
     john_perturbation.set_rel_phases()
     e_field = john_perturbation.input_e_quick()
@@ -896,9 +966,8 @@ if __name__ == "not __main__":
     plt.close(fig)
 
 #CNN test
-if __name__ == "not __main__":
+if choice == "cnn":
     cnn = FFPhaseCNN()
     dummy_input = tf.random.normal((1, 256, 256, 1))
     _ = cnn(dummy_input)
     cnn.summary()
-
