@@ -19,7 +19,6 @@ import tensorflow as tf
 import soapy
 from keras import layers, Model
 import matplotlib.pyplot as plt
-from scipy.linalg import hadamard
 from scipy.signal import CZT
 from numpy.fft import fft2, ifft2
 
@@ -121,7 +120,7 @@ class TurbulenceModeler:
             r0_total += r0 ** (-5/3)
             self.phase_catalog[i] = phase_screen
         if self.r0_check is False:
-            print(r0_total)
+            print(r0_total ** (-3/5))
             self.r0_check = True
 
 class BeamPerturbator:
@@ -215,7 +214,7 @@ class BeamPerturbator:
         R_target = np.sqrt(dx ** 2 + dy ** 2 + z_f ** 2)
         sin_theta_x = dx / R_target
         sin_theta_y = dy / R_target
-        piston = -k * R_target
+        piston = -k * (R_target - z_f)
         # summing over contributions from each aperture
         for n in range(num_apertures):
             X_local = X - x_n[n]
@@ -289,6 +288,57 @@ class BeamPerturbator:
                 y_out = (np.arange(dim_y) - dim_y / 2) * ssl
                 return field, x_out, y_out
         return self.fresnel_czt(input_field = input_field, z = z, k = k)
+
+    def compute_optimal_phases(self, n_iter, tol=1e-6, return_m = False):
+        n_elem = len(self.base_fields)
+        z = self.target_position[2]
+        bucket_radius = self.grid_length / 40
+        bucket_rows = []
+        mask = None
+        for n in range(n_elem):
+            field_out, x_out, y_out = self.fresnel_propagation(self.base_fields[n], z)
+            if mask is None:
+                cx = np.argmin(np.abs(x_out))
+                cy = np.argmin(np.abs(y_out))
+                Y, X = np.mgrid[0:field_out.shape[0], 0:field_out.shape[1]]
+                r = np.sqrt((X-cx) ** 2 + (Y-cy) ** 2)
+                mask = r <= bucket_radius
+            bucket_rows.append(field_out[mask])
+        E = np.stack(bucket_rows, axis=0)
+        M = E.conj() @ E.T
+        #print("sample M[0,0]:", M[0,0], "trace:", np.trace(M).real)
+
+        eigvals, eigvecs = np.linalg.eigh(M)
+        c = np.exp(1j * np.angle(eigvecs[:, -1]))
+
+        # baseline candidate — guarantees the result can never be worse than doing nothing
+        c_ones = np.ones(n_elem, dtype=np.complex128)
+        power_ones = np.real(c_ones.conj() @ M @ c_ones)
+
+        prev_power = -np.inf
+        power = np.real(c.conj() @ M @ c)
+        n_used = 0
+        for i in range(n_iter):
+            c = np.exp(1j * np.angle(M @ c))
+            power = np.real(c.conj() @ M @ c)
+            n_used = i + 1
+            if power - prev_power < tol * abs(power):     # relative tolerance
+                break
+            prev_power = power
+
+        ub = n_elem * eigvals[-1]
+        gap = (ub - power) / ub
+        top_eig_fraction = eigvals[-1] / np.trace(M).real
+        print(gap, top_eig_fraction)
+
+        if power_ones > power:            # safety net — should basically never trigger if math is right
+            c = c_ones
+            power = power_ones
+
+        optimal_phases = np.angle(c)
+        if return_m:
+            return optimal_phases, power, n_used, mask, M
+        return optimal_phases, power, n_used, mask
 
 class ZernikeFilterBank:
     def __init__(self, kernel_size=21, num_modes=36):
@@ -701,109 +751,6 @@ class FFPhaseCNN(Model):
         
         return phases, attention_maps
 
-class SPGDOptimizer:
-    def __init__(self, OpticalSimulator: BeamPerturbator, momentum=0):
-        # constants
-        self.fine_phase = 4096
-        self.pert_strength = 0.05
-        self.gain = 0.35
-        self.momentum = momentum
-        self.fine_to_phase = (2 * np.pi) / self.fine_phase
-        # optical components
-        self.optsim = OpticalSimulator
-        self.dist = self.optsim.target_position[2]
-        self.params = self.optsim.chan_rel_phases * self.fine_phase
-        self.chan_count = self.params.shape[0]
-        self.velocity = np.zeros_like(self.params)
-        # state tracking
-        self.iteration = 0
-        self.best_params = None
-        self.best_intensity = 0
-        # hadamard matrix dither
-        self.hadamard_order = math.ceil(np.log2(self.chan_count))
-        self.hadamard_matrix = hadamard(2**self.hadamard_order)
-        self.hadamard_count = 0
-        # intensity normalization
-        self.intensity_check = False
-        self.intensity_scale = 1
-
-    def generate_perturbation(self):
-        pos_pert = self.params.copy()
-        neg_pert = self.params.copy()
-        pert_vect = np.zeros_like(pos_pert)
-        for chan in range(self.chan_count):
-            step = self.fine_phase * self.hadamard_matrix[chan, self.hadamard_count % len(self.hadamard_matrix)] * self.pert_strength
-            pos_pert[chan] = (pos_pert[chan] + step) % self.fine_phase
-            neg_pert[chan] = (neg_pert[chan] - step) % self.fine_phase
-            pert_vect[chan] += step
-        self.hadamard_count += 1
-        if self.hadamard_count > 2**self.hadamard_order:
-            self.hadamard_count = 0
-        return pos_pert, neg_pert, pert_vect
-        
-    def gradient_estimation(self, pos_pert, neg_pert, pert_array):
-        #evaluating intensities
-        _ , _ = self.optsim.input_e_field_base()
-        self.optsim.set_rel_phases(pos_pert * self.fine_to_phase)
-        input_e_pos = self.optsim.input_e_quick()
-        e_field_pos, _, _ = self.optsim.fresnel_propagation(input_e_pos, self.dist)
-        pos_intensity = np.max(np.abs(e_field_pos)) ** 2
-
-        self.optsim.set_rel_phases(neg_pert * self.fine_to_phase)
-        input_e_neg = self.optsim.input_e_quick()
-        e_field_neg, _, _ = self.optsim.fresnel_propagation(input_e_neg, self.dist)
-        neg_intensity = np.max(np.abs(e_field_neg)) ** 2
-        # scaling intensity
-        if self.intensity_check is False:
-            self.intensity_scale = (pos_intensity + neg_intensity) / 2
-            self.intensity_check = True
-        else:
-            self.intensity_scale = (0.95 * self.intensity_scale + 
-                                    0.05 * (pos_intensity + neg_intensity) / 2)
-        # computing gradient
-        intensity_diff = pos_intensity - neg_intensity
-        gradient = intensity_diff * pert_array
-        return gradient, pos_intensity, neg_intensity
-
-    def opt_step(self):
-        pos_step, neg_step, pert = self.generate_perturbation()
-        grad, pos_inten, neg_inten = self.gradient_estimation(pos_step, neg_step, pert)
-        grad /= self.intensity_scale
-        self.velocity = self.momentum * self.velocity + (grad * self.gain) * (1-self.momentum)
-        nextparams = self.params + self.velocity
-        for i in range(len(nextparams)):
-            nextparams[i] %= self.fine_phase
-        self.params = nextparams
-        self.optsim.set_rel_phases(self.params * self.fine_to_phase)
-        current_intensity = np.average([pos_inten, neg_inten])
-        if current_intensity > self.best_intensity:
-            self.best_intensity = current_intensity
-            self.best_params = self.params.copy() * self.fine_to_phase
-        self.iteration += 1
-        return current_intensity
-
-    def optimization(self, iterations, verbose = True, verbose_frequency=10):
-        for n in range(iterations):
-            current_intensity = self.opt_step()
-            if verbose and n % verbose_frequency == 0:
-                print(f"Iteration {n:4d}: Intensity = {current_intensity:.4e},"
-                      f"Best Intensity = {self.best_intensity:.4e}")
-        if verbose:
-            print(f"\nOptimization Complete. Best Intensity Reached: {self.best_intensity:.4e}")
-        return self.best_params
-
-    def reset(self, new_params):
-        if new_params is not None:
-            self.params = new_params
-        self.velocity = np.zeros_like(self.params)
-        self.iteration = self.best_intensity = self.hadamard_count = 0
-        self.best_params = None
-        self.intensity_check = False
-        self.intensity_scale = 1
-        self.chan_count = self.optsim.chan_rel_phases.shape[0]
-        self.hadamard_order = math.ceil(np.log2(self.chan_count))
-        self.hadamard_matrix = hadamard(2**self.hadamard_order)
-
 class DatasetStore:
     def __init__(self, h5_path, image_shape, num_channels, flush_count = 16):
         self.h5_path = Path(h5_path)
@@ -847,9 +794,75 @@ class DatasetStore:
         self.flush()
         self.f.close()
 
+# Testing elements
+def linearity_test(sim):
+    z = sim.target_position[2]
+    sim.set_rel_phases()  # zero correction
+    combined_out, xo, yo = sim.fresnel_propagation(sim.input_e_quick(), z)
+
+    summed = np.zeros_like(combined_out)
+    for base in sim.base_fields:
+        out_n, _, _ = sim.fresnel_propagation(base, z)
+        summed += out_n
+
+    diff = combined_out - summed
+    print("max |combined|:  ", np.max(np.abs(combined_out)))
+    print("max |diff|:      ", np.max(np.abs(diff)))
+    print("relative error:  ", np.max(np.abs(diff)) / np.max(np.abs(combined_out)))
+
+def sdp_bound(M):
+    import cvxpy as cp
+    n = M.shape[0]
+    scale = 1.0 / np.max(np.abs(M))
+    M_scaled = M * scale
+
+    X = cp.Variable((n, n), hermitian=True)
+    constraints = [X >> 0] + [X[i, i] == 1 for i in range(n)]
+    prob = cp.Problem(cp.Maximize(cp.real(cp.trace(M_scaled @ X))), constraints)
+    prob.solve(solver=cp.SCS, eps=1e-8)
+
+    if prob.status not in ("optimal", "optimal_inaccurate"):
+        print(f"WARNING: solver status = {prob.status}")
+
+    return prob.value / scale
+
+def multi_restart_check(M, n_restarts=20, n_iter=100, tol=1e-6):
+    n = M.shape[0]
+    best_power = -np.inf
+    powers = []
+    for _ in range(n_restarts):
+        c = np.exp(1j * np.random.uniform(0, 2 * np.pi, n))
+        prev = -np.inf
+        for _ in range(n_iter):
+            c = np.exp(1j * np.angle(M @ c))
+            power = np.real(c.conj() @ M @ c)
+            if power - prev < tol * abs(power):
+                break
+            prev = power
+        powers.append(power)
+        best_power = max(best_power, power)
+    return best_power, powers
+
+def run_optimality_diagnostics(M, power_method_result):
+    n = M.shape[0]
+    eigvals = np.linalg.eigvalsh(M)
+    ub_loose = n * eigvals[-1]
+    top_eig_fraction = eigvals[-1] / np.trace(M).real
+    best_restart, all_restarts = multi_restart_check(M)
+    ub_tight = sdp_bound(M)
+
+    print(f"power-method result:          {power_method_result:.6e}")
+    print(f"best of {len(all_restarts)} restarts:          {best_restart:.6e}")
+    print(f"loose bound (n*lambda_max):   {ub_loose:.6e}")
+    print(f"tight bound (SDP):            {ub_tight:.6e}")
+    print(f"top_eig_fraction:             {top_eig_fraction:.4f}")
+    print(f"loose gap:                    {(ub_loose - power_method_result) / ub_loose:.4f}")
+    print(f"tight gap:                    {(ub_tight - power_method_result) / ub_tight:.4f}")
+
+###  Code Beginning
 if __name__ == "__main__":
     print(f"Time to import: {Timer.elapsed()}")
-    choice = input("What test are you running?\n -h5 \n -train \n -optsim \n -cnn \n")
+    choice = input("What test are you running?\n -h5 \n -train \n -optsim \n -cnn \n -diagnostics \n")
 
 #looking at testing data
 if choice == "h5":
@@ -890,37 +903,61 @@ if choice == "train":
     grid_ssl = int(input("How large should sampling be?(0.1mm)\n"))
     real_count = int(input("How many realizations do you want to generate?\n"))
     writer = DatasetStore('testtrainingdata.h5', image_shape = (grid_data_size,grid_data_size), 
-                          num_channels = 7, flush_count=real_count)
+                          num_channels = 7, flush_count=16)
     dist = 384000000
     target = [0, 0, dist]
     array = ArrayDesign(2, 'hex')
     sim = BeamPerturbator(ssl = grid_ssl*1e-4, targ_pos = target, array_des = array, 
-                          fried_mult = 64, Ideal=False, grid_length = grid_data_size)
+                          fried_mult = 16, Ideal=False, grid_length = grid_data_size)
     x, y = sim.input_e_field_base()
+
     for real in range(real_count):
         if real != 0:
             sim.generate_turbulence()
+        #linearity_test(sim)
         sim.set_rel_phases()
         input = sim.input_e_quick()
         init_e_image, x_def, y_def = sim.fresnel_propagation(input, dist)
         init_image = np.abs(init_e_image) ** 2
-        init_intensity = np.max(init_image)
 
-        spgd = SPGDOptimizer(sim, 0.5)
-        best_params = spgd.optimization(iterations = 200, verbose = False)
+        best_params, bucket_power, n_iters, mask = sim.compute_optimal_phases(100)
 
         sim.set_rel_phases(best_params)
         opt_input = sim.input_e_quick()
         opt_e_image, _, _ = sim.fresnel_propagation(opt_input, dist)
+        recomputed_power = np.sum(np.abs(opt_e_image[mask]) ** 2)
+        #print("power from M:", bucket_power, " power from direct repropagation:", recomputed_power)
         opt_image = np.abs(opt_e_image)**2
+
+        best_intensity = np.average(opt_image[mask])
+        init_intensity = np.average(init_image[mask])
 
         writer.add_example(init_image.astype('float32'), opt_image.astype('float32'), 
                            best_params.astype('float32'), fried_mult = 64, 
-                           init_intensity = init_intensity, best_intensity = spgd.best_intensity, 
-                           iterations = spgd.iteration, target_x = target[0], 
-                           target_y = target[1], x_def = x_def, y_def = y_def)
+                           init_intensity = init_intensity, best_intensity = best_intensity, 
+                           iterations = n_iters, target_x = target[0], 
+                           target_y = target[1])
         print(f"Realization #{real+1} generated. Time elapsed: {Timer.elapsed():.2f}")
     writer.close()
+
+# diagnostics:
+if choice == "diagnostics":
+    grid_data_size = int(input("Grid size?\n"))
+    grid_ssl = int(input("Sampling (0.1mm)?\n"))
+    n_samples = int(input("How many realizations to check?\n"))
+    dist = 384000000
+    target = [0, 0, dist]
+    array = ArrayDesign(2, 'hex')
+    sim = BeamPerturbator(ssl=grid_ssl * 1e-4, targ_pos=target, array_des=array,
+                          fried_mult=16, Ideal=False, grid_length=grid_data_size)
+    x, y = sim.input_e_field_base()
+
+    for i in range(n_samples):
+        if i != 0:
+            sim.generate_turbulence()
+        optimal_phases, power, n_iters, mask, M = sim.compute_optimal_phases(40, return_m=True)
+        print(f"\n--- Sample {i} ---")
+        run_optimality_diagnostics(M, power)
 
 # optical simulator test 
 if choice == "optsim":

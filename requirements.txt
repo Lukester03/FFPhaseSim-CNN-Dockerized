@@ -3,3 +3,4 @@ matplotlib==3.8.0
 tensorflow==2.13.0
 soapy==0.15.0
 pandas==2.3
+cvxpy==1.7.5
