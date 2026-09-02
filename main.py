@@ -1129,14 +1129,12 @@ if choice == "h5":
 #training CNN
 if choice == "training":
     num_epochs = int(input("How many epochs of training will you run?\n"))
-    grid_data_size = int(input("How long is the grid in your dataset?\n"))   # whatever you used for the "train" run that produced this .h5
     array = ArrayDesign(2, 'hex')
     element_positions = array.arrayvector   # shape (7, 3) — same source of truth as compute_optimal_phases
     center_idx = array.find_center_index()
     outer_positions = np.delete(element_positions, center_idx, axis=0)
 
     train_ds, val_ds, grid_size, norm_scale = DatasetStore.make_dataset('testtrainingdata.h5', batch_size=32)
-    assert grid_size == grid_data_size, "h5 image size doesn't match expected grid_width"
 
     model = FFPhaseCNN(
         laser_count=outer_positions.shape[0],
