@@ -22,6 +22,9 @@ import matplotlib.pyplot as plt
 from scipy.signal import CZT
 from numpy.fft import fft2, ifft2
 
+tf.config.threading.set_intra_op_parallelism_threads(16)
+tf.random.set_seed(42)
+
 class timer_class:
     def __init__(self):
         self.start_time = time.monotonic()
@@ -61,6 +64,11 @@ class ArrayDesign:
 
         positions_array = np.array(positions_list, dtype=np.float64)
         self.arrayvector = np.column_stack((positions_array, np.zeros(positions_array.shape[0])))
+
+    def find_center_index(self):
+        """Index of the array element closest to (0,0) — the reference beam."""
+        dists = np.linalg.norm(self.arrayvector[:, :2], axis=1)
+        return int(np.argmin(dists))
 
 class TurbulenceModeler:
     def __init__(self, wavelength: float = 1064e-9, 
@@ -108,9 +116,9 @@ class TurbulenceModeler:
 
         return phase_screens[0], r0
 
-    def all_screen_gen(self, b_val = None, gen_height = 20000):
+    def all_screen_gen(self, b_val = None, gen_height = 10000):
         r0_total = 0
-        screen_count = 32
+        screen_count = 16
         nx = self.grid_size
         self.phase_catalog = np.zeros((screen_count, nx, nx))
         screen_heights = np.linspace(0, gen_height, num = (screen_count+1))
@@ -130,6 +138,7 @@ class BeamPerturbator:
         self.phase_screens = self.apply_turb = self.h_layers = None
         self.target_position = targ_pos
         self.rel_array = array_des
+        self.center_idx = self.rel_array.find_center_index()
         self.grid_length = grid_length
         self.set_rel_phases()
         self.chan_rel_phases = np.zeros(self.rel_array.arrayvector.shape[0])
@@ -291,15 +300,15 @@ class BeamPerturbator:
 
     def compute_optimal_phases(self, n_iter, tol=1e-6, return_m = False):
         n_elem = len(self.base_fields)
-        z = self.target_position[2]
+        x_f, y_f, z = self.target_position
         bucket_radius = self.grid_length / 40
         bucket_rows = []
         mask = None
         for n in range(n_elem):
             field_out, x_out, y_out = self.fresnel_propagation(self.base_fields[n], z)
             if mask is None:
-                cx = np.argmin(np.abs(x_out))
-                cy = np.argmin(np.abs(y_out))
+                cx = np.argmin(np.abs(x_out - x_f))
+                cy = np.argmin(np.abs(y_out - y_f))
                 Y, X = np.mgrid[0:field_out.shape[0], 0:field_out.shape[1]]
                 r = np.sqrt((X-cx) ** 2 + (Y-cy) ** 2)
                 mask = r <= bucket_radius
@@ -329,11 +338,13 @@ class BeamPerturbator:
         ub = n_elem * eigvals[-1]
         gap = (ub - power) / ub
         top_eig_fraction = eigvals[-1] / np.trace(M).real
-        print(gap, top_eig_fraction)
+        #print(gap, top_eig_fraction)
 
         if power_ones > power:            # safety net — should basically never trigger if math is right
             c = c_ones
             power = power_ones
+
+        c = c * np.exp(-1j * np.angle(c[self.center_idx]))
 
         optimal_phases = np.angle(c)
         if return_m:
@@ -397,7 +408,7 @@ class GaborFilterBank(layers.Layer):
         self.gamma = gamma
         self.phase_pairs = self.include_dc_balance = True
         if wavelengths == None:
-            self.wavelengths = [3.0, 5.0, 7.0, 10.0, 14.0]
+            self.wavelengths = [5.0, 10.0]
         else:
             self.wavelengths = wavelengths
         self.sigma = [lam * 0.56 for lam in self.wavelengths]
@@ -479,19 +490,22 @@ class GaborFilterBank(layers.Layer):
 
 class ZernikeConvLayer(layers.Layer):
 
-    def __init__(self, kernel_size=21, num_modes=36, **kwargs):
+    def __init__(self, kernel_size=21, num_modes=36, stride=4, **kwargs):
         super().__init__(**kwargs)
         self.zernike_kernel = None
         self.kernel_size = kernel_size
+        self.stride = stride
         self.num_modes = num_modes
 
     def build(self, input_grid):
         zernike_gen = ZernikeFilterBank(self.kernel_size, self.num_modes)
         kernel_np = zernike_gen.generate_filter_bank()
+        in_channels = input_grid[-1]
+        kernel_np = np.tile(kernel_np, [1, 1, in_channels, 1])
         # store Zernike polynomial filter as untrainable weight to ensure consistency
         self.zernike_kernel = self.add_weight(
             name='zern_kern',
-            shape=(self.kernel_size, self.kernel_size, 1, self.num_modes),
+            shape=(self.kernel_size, self.kernel_size, in_channels, self.num_modes),
             initializer=tf.constant_initializer(kernel_np),
             trainable=False
         )
@@ -513,9 +527,9 @@ class ZernikeConvLayer(layers.Layer):
         output = tf.nn.conv2d(
             padded,
             self.zernike_kernel,
-            strides=[1, 1, 1, 1],
+            strides=[1, self.stride, self.stride, 1],
             padding='VALID',
-            )
+        )
         return output
 
 
@@ -531,9 +545,10 @@ class GaborConvLayer(layers.Layer):
     
     def __init__(self,
                  kernel_size=15,
-                 num_orientations=8,
+                 num_orientations=4,
                  wavelengths=None,
                  gamma=0.5,
+                 stride=4,
                  **kwargs):
         super().__init__(**kwargs)
         
@@ -541,6 +556,7 @@ class GaborConvLayer(layers.Layer):
         self.kernel_size = kernel_size
         self.num_orientations = num_orientations
         self.wavelengths = wavelengths
+        self.stride = stride
         self.gamma = gamma
         
         # Build the filter bank
@@ -590,7 +606,7 @@ class GaborConvLayer(layers.Layer):
         output = tf.nn.conv2d(
             padded,
             self.conv_kernel,
-            strides=[1, 1, 1, 1],
+            strides=[1, self.stride, self.stride, 1],
             padding='VALID'
         )
         
@@ -612,30 +628,38 @@ class GaborConvLayer(layers.Layer):
         return config
 
 class FiLMConditioner(layers.Layer):
-    def __init__(self, num_features, **kwargs):
+    def __init__(self, num_features, pos_dim, **kwargs):
         super().__init__(**kwargs)
         self.mlp = tf.keras.Sequential([
-            layers.Dense(32,activation='relu'),
-            layers.Dense(2 * num_features),
+            layers.Dense(64, activation='leaky_relu', kernel_initializer='he_normal'),
+            layers.Dense(64, activation='leaky_relu', kernel_initializer='he_normal'),
+            layers.Dense(2 * num_features,
+                         kernel_initializer=tf.keras.initializers.RandomNormal(stddev=0.01)),
         ])
-    def call(self, features, position):
-        gb = self.mlp(position)
+        self.pos_dim = pos_dim
+
+    def build(self, input_shape):
+        self.mlp.build((None, self.pos_dim))
+        super().build(input_shape)
+
+    def call(self, features, position_encoded):
+        gb = self.mlp(position_encoded)
         gamma, beta = tf.split(gb, 2, axis=-1)
         gamma = gamma[:, None, None, :]
         beta = beta[:, None, None, :]
         return features * (1 + gamma) + beta
 
 class FFPhaseCNN(Model):
-    def __init__(self, grid_width = 256, mode_count=36, 
-        gabor_kernel_size = 15, gabor_orientations = 8, gabor_lmbda = None, laser_count = 7,
-        element_positions = None, processor_channels = [64, 64, 32], **kwargs):
+    def __init__(self, mode_count = 16, 
+        gabor_kernel_size = 9, gabor_orientations = 8, gabor_lmbda = None, laser_count = 7,
+        element_positions = None, raw_channels = 16, stride = 4, **kwargs):
         super().__init__(**kwargs)
         self.num_modes = mode_count
         self.gabor_kern_size = gabor_kernel_size
         self.gabor_orientations = gabor_orientations
         self.gabor_lmbda = gabor_lmbda
         self.num_lasers = laser_count
-        if element_positions == None:
+        if element_positions is None:
             element_positions = [[-0.8660254, -0.5, 0.],
                                  [-0.8660254, 0.5, 0.],
                                  [ 0., -1., 0.],
@@ -643,116 +667,157 @@ class FFPhaseCNN(Model):
                                  [ 0., 1., 0.],
                                  [ 0.8660254, -0.5, 0.],
                                  [ 0.8660254, 0.5, 0.]]
-        self.element_positions = np.asarray(element_positions)
+        self.element_positions = np.asarray(element_positions, dtype=np.float32)
 
-        # Zernike Basis for reconstructing phase
-        self.zernike_basis = ZernikeFilterBank(grid_width, self.num_modes).generate_filter_bank()
-        
-        # Non-trainable filter layers:
-        
-        self.zernike_conv = ZernikeConvLayer(kernel_size = 21, num_modes = mode_count, name = "zernike_features")
+        self.zernike_conv = ZernikeConvLayer(kernel_size = 11, num_modes = mode_count, stride = stride, name = "zernike_features")
         self.gabor_conv = GaborConvLayer(kernel_size = gabor_kernel_size, 
-        num_orientations = gabor_orientations, wavelengths = gabor_lmbda, gamma = 0.5, name = "gabor_features")
+        num_orientations = gabor_orientations, wavelengths = gabor_lmbda, stride=stride, gamma = 0.5, name = "gabor_features")
 
         # Processor Channel Counts:
+        self.Zernike_chan = mode_count
+        self.Gabor_chan = gabor_orientations * 4
+        self.Raw_chan = int(raw_channels)
 
-        self.Zernike_chan = int(processor_channels[0])
-        self.Gabor_chan = int(processor_channels[1])
-        self.Raw_chan = int(processor_channels[2])
+        #early downsample to improve model speed
+        self.i_downsample = tf.keras.Sequential([
+            layers.Conv2D(16, 3, strides=2, padding='SAME', activation='leaky_relu', kernel_initializer = 'he_normal'),  # 128×128
+            layers.Conv2D(32, 3, strides=2, padding='SAME', activation='leaky_relu', kernel_initializer = 'he_normal'),  # 64×64
+        ], name='downsample_i')
         
         # Processors
         self.zernike_processor = tf.keras.Sequential([
             layers.BatchNormalization(name='zernike_bn'),
-            layers.Conv2D(self.Zernike_chan, 1, activation='relu', name='zernike_compress'),
-            layers.Conv2D(self.Zernike_chan, 3, padding='SAME', activation='relu', 
+            layers.Conv2D(self.Zernike_chan, 1, kernel_initializer = 'he_normal', activation='leaky_relu', name='zernike_compress'),
+            layers.Conv2D(self.Zernike_chan, 3, kernel_initializer = 'he_normal', padding='SAME', activation='leaky_relu', 
                          name='zernike_process1'),
-            layers.Conv2D(self.Zernike_chan, 3, padding='SAME', activation='relu', 
+            layers.Conv2D(self.Zernike_chan, 3, padding='SAME', activation='leaky_relu', 
                          name='zernike_process2'),
         ], name='zernike_processor')
         
         self.gabor_processor = tf.keras.Sequential([
-            tf.keras.layers.BatchNormalization(name='gabor_bn'),
-            layers.Conv2D(self.Gabor_chan, 1, activation='relu', name='gabor_compress'),
-            layers.Conv2D(self.Gabor_chan, 3, padding='SAME', activation='relu', 
+            layers.BatchNormalization(name='gabor_bn'),
+            layers.Conv2D(self.Gabor_chan, 1, activation='leaky_relu', kernel_initializer='he_normal', name='gabor_compress'),
+            layers.Conv2D(self.Gabor_chan, 3, padding='SAME', activation='leaky_relu', kernel_initializer = 'he_normal', 
                          name='gabor_process1'),
-            layers.Conv2D(self.Gabor_chan, 3, padding='SAME', activation='relu', 
+            layers.Conv2D(self.Gabor_chan, 3, padding='SAME', activation='leaky_relu', kernel_initializer = 'he_normal', 
                          name='gabor_process2'),
         ], name='gabor_processor')
         
         self.intensity_processor = tf.keras.Sequential([
-            layers.Conv2D(self.Raw_chan, 7, padding='SAME', activation='relu', 
+            layers.Conv2D(self.Raw_chan, 7, padding='SAME', activation='leaky_relu', kernel_initializer = 'he_normal', 
                          name='intensity_conv1'),
             layers.BatchNormalization(name='intensity_bn1'),
-            layers.Conv2D(self.Raw_chan, 5, padding='SAME', activation='relu', 
+            layers.Conv2D(self.Raw_chan, 5, padding='SAME', activation='leaky_relu', kernel_initializer = 'he_normal', 
                          name='intensity_conv2'),
         ], name='intensity_processor')
-        
-        #Laser attention to separate lasers in image
-        self.laser_attention = tf.keras.Sequential([
-            layers.Conv2D(64, 1, activation='relu'),
-            layers.Conv2D(self.num_lasers, 1, activation='sigmoid'),
-        ], name='laser_attention')
+
+        # extra prelaser downsample
+        self.pre_laser_downsample = tf.keras.Sequential([
+            layers.Conv2D(self.Zernike_chan + self.Gabor_chan + self.Raw_chan, 3, strides = 2, padding = 'SAME', activation='leaky_relu', kernel_initializer = 'he_normal')
+        ], name = 'pre_laser_downsample')
         
         #decodes each laser's values
         self.shared_decoder = tf.keras.Sequential([
-            layers.Conv2D(64, 3, padding='SAME', activation='relu'),
+            layers.Conv2D(64, 3, padding='SAME', activation='leaky_relu', kernel_initializer='he_normal'),
             layers.BatchNormalization(),
-            layers.Conv2D(32, 3, padding='SAME', activation='relu'),
+            layers.Conv2D(32, 3, padding='SAME', activation='leaky_relu', kernel_initializer='he_normal'),
             layers.BatchNormalization(),
-            layers.Conv2D(16, 3, padding='SAME', activation='relu'),
+            layers.Conv2D(16, 3, padding='SAME', activation='leaky_relu', kernel_initializer='he_normal'),
             layers.Conv2D(2, 3, padding='SAME'),
         ], name='shared_decoder')
 
         # coefficients
         self.coeff_head = tf.keras.Sequential([
-            layers.Dense (64, activation='relu'),
-            layers.Dense(self.num_modes),
+            layers.Dense(64, activation='leaky_relu', kernel_initializer='he_normal'),
+            layers.BatchNormalization(),
+            layers.Dense(self.num_modes, activation='tanh', bias_initializer=tf.keras.initializers.RandomUniform(-0.3,0.3)),
+            layers.Lambda(lambda x: x * np.pi)
         ], name = 'coeff_head')
 
-        self.film = FiLMConditioner(sum(processor_channels))
+        pos_dim = 2 + 4 * 6  # matches sinusoidal_position_encoding defaults
+        self.film_early = FiLMConditioner(self.Zernike_chan + self.Gabor_chan + self.Raw_chan, pos_dim, name="film_early")
+        self.film = FiLMConditioner(self.Zernike_chan + self.Gabor_chan + self.Raw_chan, pos_dim, name="film_late")
         self.global_pool = layers.GlobalAveragePooling2D()
 
-    def reconstruct_phase(self, coeffs, zernike_basis, aperture_mask):
-        phase = tf.einsum('bm,hwlm->bhw', coeffs, zernike_basis)
-        return phase[..., None] * aperture_mask
-    
+    # sinusoidal pos encoding
+    @staticmethod
+    def sinusoidal_position_encoding(positions, num_bands=6, max_freq=8.0):
+        """positions: [N, 2] raw (x, y) -> [N, 2 + 4*num_bands] encoded."""
+        freqs = tf.constant(
+            np.geomspace(1.0, max_freq, num_bands), dtype=tf.float32
+        )  # [num_bands]
+        pos = tf.cast(positions, tf.float32)  # [N, 2]
+        # [N, 2, num_bands]
+        scaled = pos[:, :, None] * freqs[None, None, :] * np.pi
+        sin_feats = tf.sin(scaled)
+        cos_feats = tf.cos(scaled)
+        encoded = tf.concat([
+            pos,
+            tf.reshape(sin_feats, [tf.shape(pos)[0], -1]),
+            tf.reshape(cos_feats, [tf.shape(pos)[0], -1]),
+        ], axis=-1)  # [N, 2 + 4*num_bands]
+        return encoded
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'mode_count': self.num_modes,
+            'gabor_kernel_size': self.gabor_kern_size,
+            'gabor_orientations': self.gabor_orientations,
+            'gabor_lmbda': self.gabor_lmbda,
+            'laser_count': self.num_lasers,
+            'element_positions': self.element_positions.tolist(),
+        })
+        return config
+
     def call(self, inputs, training = False):
-        zernike_raw = self.zernike_conv(inputs)  # [B, H, W, 36]
-        gabor_raw = self.gabor_conv(inputs)      # [B, H, W, 80]
+        down_inputs = self.i_downsample(inputs)
+        zernike_down = self.zernike_conv(inputs)
+        gabor_down = self.gabor_conv(inputs)
 
-        # Features processing
-        z_features = self.zernike_processor(zernike_raw, training=training)
-        g_features = self.gabor_processor(gabor_raw, training=training)
-        i_features = self.intensity_processor(inputs, training=training)
+        z_features = self.zernike_processor(zernike_down, training=training)
+        g_features = self.gabor_processor(gabor_down, training=training)
+        i_features = self.intensity_processor(down_inputs, training=training)
 
-        # Concatenate all features
-        combined = tf.concat([z_features, g_features, i_features], axis=-1)
-        
-        # Implement attention per laser
-        attention_maps = self.laser_attention(combined)
-        
-        # Phase decoder
-        phases = []
-        for i in range(self.num_lasers):
-            laser_mask = attention_maps[..., i:i+1]
-            laser_features = combined * laser_mask
-            pos = tf.constant([[self.element_positions[i,0], self.element_positions[i,1]]], dtype=tf.float32)
-            pos = tf.tile(pos, [tf.shape(inputs)[0], 1])
-            conditioned = self.film(laser_features, pos)
-            pooled = self.global_pool(conditioned)
-            coeffs = self.coeff_head(pooled)
-            phase_components = self.shared_decoder(conditioned, training=training)
-            phase_sin = phase_components[..., 0:1]
-            phase_cos = phase_components[..., 1:2]
-            phase_analytic = self.reconstruct_phase(coeffs, self.zernike_basis, laser_mask)
-            phase_residual = tf.atan2(phase_sin, phase_cos)
-            phase = phase_analytic + phase_residual
-            phases.append(phase)
-        
-        return phases, attention_maps
+        combined = tf.concat([z_features, g_features, i_features], axis=-1)  # [B, H, W, C]
+        B = tf.shape(inputs)[0]
+        L = self.num_lasers
+        pos_all = tf.constant(self.element_positions[:, :2], dtype=tf.float32)
+        pos_encoded = self.sinusoidal_position_encoding(pos_all)          # [L, pos_dim]
+        pos_encoded_tiled = tf.tile(pos_encoded[None, ...], [B, 1, 1])
+        pos_encoded_flat = tf.reshape(pos_encoded_tiled, [B * L, -1])  # [B*L, pos_dim]
+
+        Hc, Wc, Cc = combined.shape[1], combined.shape[2], combined.shape[3]
+        combined_tiled_full = tf.repeat(combined[:, None, ...], L, axis=1)
+        combined_tiled_full = tf.reshape(combined_tiled_full, [B * L, Hc, Wc, Cc])
+
+        # Early FiLM: content and position interact BEFORE downsampling/pooling.
+        combined_tiled_full = self.film_early(combined_tiled_full, pos_encoded_flat)
+        combined_tiled_full = self.pre_laser_downsample(combined_tiled_full)  # now per-(B*L), not per-B
+
+        H, W, C = combined_tiled_full.shape[1], combined_tiled_full.shape[2], combined_tiled_full.shape[3]
+
+        conditioned = self.film(combined_tiled_full, pos_encoded_flat)
+        pooled = self.global_pool(conditioned)
+        coeffs = self.coeff_head(pooled)
+        piston_coeff = coeffs[:, 0]
+
+        phase_components = self.shared_decoder(conditioned, training=training)
+        phase_sin = phase_components[..., 0:1]
+        phase_cos = phase_components[..., 1:2]
+        phase_residual = tf.atan2(phase_sin, phase_cos)
+
+        sin_mean = tf.reduce_mean(tf.sin(phase_residual), axis=[1, 2, 3])
+        cos_mean = tf.reduce_mean(tf.cos(phase_residual), axis=[1, 2, 3])
+        residual_mean = tf.atan2(sin_mean, cos_mean)
+
+        phases_flat = piston_coeff + residual_mean
+        predicted_phases = tf.reshape(phases_flat, [B, L])
+
+        return predicted_phases
 
 class DatasetStore:
-    def __init__(self, h5_path, image_shape, num_channels, flush_count = 16):
+    def __init__(self, h5_path, image_shape, num_channels, flush_count = 8, initial_size = 100):
         self.h5_path = Path(h5_path)
         self.catalog_path = self.h5_path.with_suffix('.catalog.csv')
         self.image_shape = image_shape
@@ -760,28 +825,104 @@ class DatasetStore:
         self.flush_count = flush_count
         self._catalog_rows = []
         self._n = 0
+        self._allocated = 0
 
         self.f = h5py.File(self.h5_path, 'a')
         if 'images' not in self.f:
+            self._allocated = initial_size
             self.f.create_dataset('images', shape=(0, *image_shape), maxshape=(None, *image_shape),
                                    dtype='float32', chunks=(1, *image_shape), compression='gzip')
             self.f.create_dataset('opt_images', shape=(0, *image_shape), maxshape=(None, *image_shape),
                                    dtype='float32', chunks=(1, *image_shape), compression='gzip')
             self.f.create_dataset('labels', shape=(0, num_channels), maxshape=(None, num_channels),
                                    dtype='float32')
-        self._n = self.f['images'].shape[0]
+        self._allocated = self.f['images'].shape[0]
+        self._n = self._count_actual_examples()
+
+    def _count_actual_examples(self):
+        if self.catalog_path.exists():
+            catalog = pd.read_csv(self.catalog_path)
+            return len(catalog)
+        return 0
+
+    def _ensure_capacity(self, needed):
+        current_size = self.f['images'].shape[0]
+        if needed > self._allocated:
+            new_size = max(needed, self._allocated * 2 if current_size > 0 else self._allocated)
+            for ds_name in ['images', 'opt_images', 'labels']:
+                self.f[ds_name].resize(new_size, axis=0)
+            self._allocated = new_size
 
     def add_example(self, image, opt_image, label_rad, **metadata):
+        self._ensure_capacity(self._n+1)
         n = self._n
-        for ds_name, arr in [('images', image), ('opt_images', opt_image), ('labels', label_rad)]:
-            ds = self.f[ds_name]
-            ds.resize(n + 1, axis=0)
-            ds[n] = arr
+        self.f['images'][n] = image
+        self.f['opt_images'][n] = opt_image
+        self.f['labels'][n] = label_rad
+
         row = {'index':n, **metadata}
         self._catalog_rows.append(row)
         self._n += 1
+
         if self._n % self.flush_count == 0:
             self.flush()
+    
+    @staticmethod
+    def make_dataset(h5_path, batch_size=8, shuffle=True, val_split=0.1, intensity_clip_percentile=99.9):
+        h5_path = Path(h5_path)
+        f = h5py.File(h5_path, 'r')
+
+        n_total = f['images'].shape[0]
+        grid_size = f['images'].shape[1]
+        num_channels = f['labels'].shape[1]
+        if h5_path.with_suffix('.catalog.csv').exists():
+            catalog = pd.read_csv(h5_path.with_suffix('.catalog.csv'))
+            n_total = len(catalog)
+
+        indices = np.arange(n_total)
+        if shuffle:
+            rng = np.random.default_rng()
+            rng.shuffle(indices)
+        n_val = int(n_total * val_split)
+        val_idx, train_idx = indices[:n_val], indices[n_val:]
+        n_samples = min(100, len(train_idx))
+        sample_idx = np.sort(np.random.choice(train_idx, n_samples, replace=False))
+        sample_images = f['images'][sample_idx]
+        norm_scale = np.percentile(sample_images, intensity_clip_percentile)
+
+        del sample_images
+
+        def gen(idx_array):
+            for i in idx_array:
+                image = f['images'][i].astype(np.float32)
+                label = f['labels'][i].astype(np.float32)
+                yield image, label
+
+        output_signature = (
+            tf.TensorSpec(shape=(grid_size, grid_size), dtype=tf.float32),
+            tf.TensorSpec(shape=(num_channels,), dtype=tf.float32),
+        )
+
+        def preprocess(image, label):
+            image = tf.clip_by_value(image, 0.0, norm_scale) / norm_scale
+            image = tf.math.log1p(image * 1000.0)
+            image = image[..., None]
+            return image, label
+
+        def build(idx_array, training):
+            with h5py.File(h5_path, 'r') as f:
+                all_images = f['images'][:][idx_array].astype(np.float32)
+                all_labels = f['labels'][:][idx_array].astype(np.float32)
+            ds = tf.data.Dataset.from_tensor_slices((all_images, all_labels))
+            ds = ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+            if training:
+                ds = ds.shuffle(1024)
+            ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+            return ds
+
+        train_ds = build(train_idx, training=True)
+        val_ds = build(val_idx, training=False)
+        return train_ds, val_ds, grid_size, norm_scale
 
     def flush(self):
         self.f.flush()
@@ -793,6 +934,10 @@ class DatasetStore:
     def close(self):
         self.flush()
         self.f.close()
+# model decorator
+@tf.function
+def forward_pass(model, inputs):
+    return model(inputs, training=False)
 
 # Testing elements
 def linearity_test(sim):
@@ -809,6 +954,24 @@ def linearity_test(sim):
     print("max |combined|:  ", np.max(np.abs(combined_out)))
     print("max |diff|:      ", np.max(np.abs(diff)))
     print("relative error:  ", np.max(np.abs(diff)) / np.max(np.abs(combined_out)))
+
+def circular_phase_loss(y_true, y_pred):
+    # Normalize both to [-π, π] first
+    y_true_norm = tf.atan2(tf.sin(y_true), tf.cos(y_true))
+    y_pred_norm = tf.atan2(tf.sin(y_pred), tf.cos(y_pred))
+    
+    # Compute wrapped difference
+    diff = y_true_norm - y_pred_norm
+    diff = tf.atan2(tf.sin(diff), tf.cos(diff))  # Wrap to [-π, π]
+    
+    # Use cosine similarity as additional signal
+    cos_similarity = tf.cos(y_true - y_pred)
+    
+    # Combined loss
+    angular_loss = tf.reduce_mean(tf.abs(diff))
+    cos_loss = tf.reduce_mean(1 - cos_similarity)
+    
+    return angular_loss + 0.5 * cos_loss
 
 def sdp_bound(M):
     import cvxpy as cp
@@ -862,7 +1025,73 @@ def run_optimality_diagnostics(M, power_method_result):
 ###  Code Beginning
 if __name__ == "__main__":
     print(f"Time to import: {Timer.elapsed()}")
-    choice = input("What test are you running?\n -h5 \n -train \n -optsim \n -cnn \n -diagnostics \n")
+    choice = input("""What test are you running?
+    -h5
+    -train data 
+    -training 
+    -optsim 
+    -cnn 
+    -opt_diagnostics 
+    -bottleneck
+    -lr_range_test\n""")
+
+if choice == 'lr_range_test':
+    def lr_range_test(model_fn, train_ds, start_lr=1e-5, end_lr=1e-2, num_steps=100):
+        model = model_fn()   # fresh model
+        lrs = np.geomspace(start_lr, end_lr, num_steps)
+        losses = []
+        optimizer = tf.keras.optimizers.Adam(learning_rate=start_lr)
+        data_iter = iter(train_ds.repeat())
+        for lr in lrs:
+            optimizer.learning_rate.assign(lr)
+            images, labels = next(data_iter)
+            with tf.GradientTape() as tape:
+                predicted_phases = model(images, training=True)
+                loss = circular_phase_loss(labels, predicted_phases)
+            grads = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            losses.append(float(loss))
+            print(Timer.elapsed())
+        return lrs, losses
+
+    array = ArrayDesign(2, 'hex')
+    element_positions = array.arrayvector
+    center_idx = array.find_center_index()
+    outer_positions = np.delete(element_positions, center_idx, axis=0)
+    train_ds, val_ds, grid_size, norm_scale = DatasetStore.make_dataset('testtrainingdata.h5', batch_size=32)
+    lrs, losses = lr_range_test(lambda: FFPhaseCNN(laser_count=outer_positions.shape[0], element_positions=outer_positions), train_ds)
+    for lr, loss in zip(lrs, losses):
+        print(f"{lr:.2e}: {loss:.4f}")
+
+if choice == 'bottleneck':
+    model = FFPhaseCNN()
+    inputs = tf.random.normal((1, 1024, 1024, 1))
+    _ = forward_pass(model=model, inputs=inputs)   # warm up / trace once, discard
+
+    def timeit(fn, n=20):
+        t0 = Timer.elapsed()
+        for _ in range(n):
+            out = fn()
+        return (Timer.elapsed() - t0) / n, out
+
+    down_t, down_inputs = timeit(lambda: model.i_downsample(inputs))
+    zern_t, zernike_raw = timeit(lambda: model.zernike_conv(inputs))
+    gabor_t, gabor_raw = timeit(lambda: model.gabor_conv(inputs))
+    zproc_t, z_features = timeit(lambda: model.zernike_processor(zernike_raw, training=False))
+    gproc_t, g_features = timeit(lambda: model.gabor_processor(gabor_raw, training=False))
+    iproc_t, i_features = timeit(lambda: model.intensity_processor(down_inputs, training=False))
+    combined = tf.concat([z_features, g_features, i_features], axis=-1)
+    full_t, _ = timeit(lambda: forward_pass(model=model, inputs=inputs))
+
+    print(f"downsample:     {down_t:.4f}s")
+    print(f"zernike_conv:   {zern_t:.4f}s")
+    print(f"gabor_conv:     {gabor_t:.4f}s")
+    print(f"zernike_proc:   {zproc_t:.4f}s")
+    print(f"gabor_proc:     {gproc_t:.4f}s")
+    print(f"intensity_proc: {iproc_t:.4f}s")
+    print(f"sum of above:   {down_t+zern_t+gabor_t+zproc_t+gproc_t+iproc_t:.4f}s")
+    print(f"full forward:   {full_t:.4f}s")
+    print(f"laser-loop portion (full minus sum): {full_t - (down_t+zern_t+gabor_t+zproc_t+gproc_t+iproc_t):.4f}s")
 
 #looking at testing data
 if choice == "h5":
@@ -897,18 +1126,78 @@ if choice == "h5":
     plt.savefig(f'outputs/example_{example_num}.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
 
+#training CNN
+if choice == "training":
+    num_epochs = int(input("How many epochs of training will you run?\n"))
+    grid_data_size = int(input("How long is the grid in your dataset?\n"))   # whatever you used for the "train" run that produced this .h5
+    array = ArrayDesign(2, 'hex')
+    element_positions = array.arrayvector   # shape (7, 3) — same source of truth as compute_optimal_phases
+    center_idx = array.find_center_index()
+    outer_positions = np.delete(element_positions, center_idx, axis=0)
+
+    train_ds, val_ds, grid_size, norm_scale = DatasetStore.make_dataset('testtrainingdata.h5', batch_size=32)
+    assert grid_size == grid_data_size, "h5 image size doesn't match expected grid_width"
+
+    model = FFPhaseCNN(
+        laser_count=outer_positions.shape[0],
+        element_positions=outer_positions,
+    )
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate = 3e-3, clipnorm = 0.5, beta_1 = 0.9, beta_2 = 0.98, epsilon = 1e-8)
+
+    @tf.function
+    def train_step(images, labels):
+        with tf.GradientTape() as tape:
+            predicted_phases = model(images, training = True)
+            loss = circular_phase_loss(labels, predicted_phases)
+        grads = tape.gradient(loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+        return loss
+    best_val_loss = float('inf')
+
+    images, labels = next(iter(train_ds))  # same fixed batch every step
+    print("test begin")
+    for step in range(151):
+        with tf.GradientTape() as tape:
+            predicted_phases = model(images, training=True)
+            loss = circular_phase_loss(labels, predicted_phases)
+        grads = tape.gradient(loss, model.trainable_variables)
+        # check for dead/vanishing gradients directly
+        grad_norms = [tf.norm(g).numpy() for g in grads if g is not None]
+        none_grads = sum(1 for g in grads if g is None)
+        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+        if step % 10 == 0:
+            print(f"step {step}: loss={float(loss):.4f}  "
+                f"grad_norm_min={min(grad_norms):.2e}  grad_norm_max={max(grad_norms):.2e}  "
+                f"none_grads={none_grads}")
+    exit()
+    for epoch in range(num_epochs):
+        epoch_losses = []
+        for images, labels in train_ds:
+            loss = train_step(images, labels)
+            epoch_losses.append(loss)
+        val_losses = [circular_phase_loss(label, model(im, training=False)) for im, label in val_ds]
+        avg_val_loss = np.mean(val_losses)
+        avg_train_loss = np.mean([l.numpy() for l in epoch_losses])
+        print(f"Epoch {epoch}: train_loss = {avg_train_loss:.4f}, val_loss = {avg_val_loss:.4f}")
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            model.save_weights('outputs/best_weights.weights.h5')
+
 #testing data generation
-if choice == "train":
+if choice == "train data":
     grid_data_size = int(input("How long should the grid be?\n"))
     grid_ssl = int(input("How large should sampling be?(0.1mm)\n"))
     real_count = int(input("How many realizations do you want to generate?\n"))
+    fried_m = 16
+    array = ArrayDesign(2, 'hex')
     writer = DatasetStore('testtrainingdata.h5', image_shape = (grid_data_size,grid_data_size), 
-                          num_channels = 7, flush_count=16)
+                          num_channels = array.arrayvector.shape[0]-1, flush_count=16)
     dist = 384000000
     target = [0, 0, dist]
-    array = ArrayDesign(2, 'hex')
     sim = BeamPerturbator(ssl = grid_ssl*1e-4, targ_pos = target, array_des = array, 
-                          fried_mult = 16, Ideal=False, grid_length = grid_data_size)
+                          fried_mult = fried_m, Ideal=False, grid_length = grid_data_size)
     x, y = sim.input_e_field_base()
 
     for real in range(real_count):
@@ -932,8 +1221,10 @@ if choice == "train":
         best_intensity = np.average(opt_image[mask])
         init_intensity = np.average(init_image[mask])
 
+        outer_params = np.delete(best_params, sim.center_idx)
+
         writer.add_example(init_image.astype('float32'), opt_image.astype('float32'), 
-                           best_params.astype('float32'), fried_mult = 64, 
+                           outer_params.astype('float32'), fried_mult = fried_m, 
                            init_intensity = init_intensity, best_intensity = best_intensity, 
                            iterations = n_iters, target_x = target[0], 
                            target_y = target[1])
@@ -941,7 +1232,7 @@ if choice == "train":
     writer.close()
 
 # diagnostics:
-if choice == "diagnostics":
+if choice == "opt_diagnostics":
     grid_data_size = int(input("Grid size?\n"))
     grid_ssl = int(input("Sampling (0.1mm)?\n"))
     n_samples = int(input("How many realizations to check?\n"))
@@ -1005,6 +1296,16 @@ if choice == "optsim":
 #CNN test
 if choice == "cnn":
     cnn = FFPhaseCNN()
-    dummy_input = tf.random.normal((1, 256, 256, 1))
-    _ = cnn(dummy_input)
+    dummy_input = tf.random.normal((1, 1024, 1024, 1))
+    pred = cnn(dummy_input)
+    print(f"Initial predictions: {pred.numpy()}")
+    print(f"Mean: {np.mean(pred.numpy()):.4f}")
+    print(f"Std: {np.std(pred.numpy()):.4f}")
     cnn.summary()
+
+if choice == 'label_div':
+    with h5py.File('testtrainingdata.h5', 'r') as f:
+        all_labels = f['labels'][:512]
+    print("per-channel std:", np.std(all_labels, axis=0))
+    print("per-channel range:", np.ptp(all_labels, axis=0))
+    print("per-channel mean:", np.mean(all_labels, axis=0))
