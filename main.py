@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import warnings
+import csv
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 warnings.filterwarnings('ignore')
@@ -939,6 +940,26 @@ class DatasetStore:
 def forward_pass(model, inputs):
     return model(inputs, training=False)
 
+#learning rate schedule - Warmup
+class lr_warmup(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, initial_learning_rate, flat_learning_rate, warmup_steps = 20):
+        self.initial_learning_rate = initial_learning_rate
+        self.flat_learning_rate = flat_learning_rate
+        self.lr_diff = self.flat_learning_rate - self.initial_learning_rate
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        pct = tf.minimum(step / self.warmup_steps, 1.0)
+        return self.initial_learning_rate + pct * (self.lr_diff)
+
+    def get_config(self):
+            return {
+            "initial_learning_rate": float(self.initial_learning_rate.numpy()),
+            "flat_learning_rate": float(self.flat_learning_rate.numpy()),
+            "warmup_steps": float(self.warmup_steps.numpy()),
+            }
+
 # Testing elements
 def linearity_test(sim):
     z = sim.target_position[2]
@@ -1141,7 +1162,7 @@ if choice == "training":
         element_positions=outer_positions,
     )
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate = 3e-3, clipnorm = 0.5, beta_1 = 0.9, beta_2 = 0.98, epsilon = 1e-8)
+    optimizer = tf.keras.optimizers.Adam(learning_rate = lr_warmup(1e-7, 1e-3, 20), clipnorm = 0.5, beta_1 = 0.9, beta_2 = 0.98, epsilon = 1e-8)
 
     @tf.function
     def train_step(images, labels):
@@ -1153,8 +1174,22 @@ if choice == "training":
         return loss
     best_val_loss = float('inf')
 
+    #Single Batch training test 
     images, labels = next(iter(train_ds))  # same fixed batch every step
+    csv_file = csv_writer = None
     print("test begin")
+    log_path='outputs/overfit_logs/warmup_b098_c05_lr0_001.csv'
+    run_label='warmup_beta098_clip05_lr0_001'
+
+    if log_path is not None:
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        csv_file = open(log_path, mode='w', newline='')
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow([
+            'run_label', 'timestamp', 'step', 'loss',
+            'grad_norm_min', 'grad_norm_max', 'none_grads', 'learning_rate'
+        ])
+    
     for step in range(151):
         with tf.GradientTape() as tape:
             predicted_phases = model(images, training=True)
@@ -1164,11 +1199,30 @@ if choice == "training":
         grad_norms = [tf.norm(g).numpy() for g in grads if g is not None]
         none_grads = sum(1 for g in grads if g is None)
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
+        lr = optimizer.learning_rate
+        current_lr = float(lr(optimizer.iterations)) if callable(lr) else float(lr)
+
+        loss_val = float(loss)
+        grad_min = min(grad_norms) if grad_norms else float('nan')
+        grad_max = max(grad_norms) if grad_norms else float('nan')
+
+        if csv_writer is not None:
+            csv_writer.writerow([
+                run_label, datetime.now().isoformat(timespec='seconds'),
+                step, loss_val, grad_min, grad_max, none_grads, current_lr
+            ])
+            if step % 10 == 0:
+                csv_file.flush()  # periodic flush so a crash doesn't lose the whole file
+
         if step % 10 == 0:
-            print(f"step {step}: loss={float(loss):.4f}  "
-                f"grad_norm_min={min(grad_norms):.2e}  grad_norm_max={max(grad_norms):.2e}  "
-                f"none_grads={none_grads}")
+            print(f"step {step}: loss={loss_val:.4f}  "
+                  f"grad_norm_min={grad_min:.2e}  grad_norm_max={grad_max:.2e}  "
+                  f"none_grads={none_grads}  lr={current_lr:.2e}")
+
+    if csv_file is not None:
+        csv_file.close()
     exit()
+    #normally implemented training
     for epoch in range(num_epochs):
         epoch_losses = []
         for images, labels in train_ds:
