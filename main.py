@@ -681,7 +681,9 @@ class FFPhaseCNN(Model):
 
         #early downsample to improve model speed
         self.i_downsample = tf.keras.Sequential([
+            layers.BatchNormalization(),
             layers.Conv2D(16, 3, strides=2, padding='SAME', activation='leaky_relu', kernel_initializer = 'he_normal'),  # 128×128
+            layers.BatchNormalization(),
             layers.Conv2D(32, 3, strides=2, padding='SAME', activation='leaky_relu', kernel_initializer = 'he_normal'),  # 64×64
         ], name='downsample_i')
         
@@ -689,8 +691,10 @@ class FFPhaseCNN(Model):
         self.zernike_processor = tf.keras.Sequential([
             layers.BatchNormalization(name='zernike_bn'),
             layers.Conv2D(self.Zernike_chan, 1, kernel_initializer = 'he_normal', activation='leaky_relu', name='zernike_compress'),
+            layers.BatchNormalization(),
             layers.Conv2D(self.Zernike_chan, 3, kernel_initializer = 'he_normal', padding='SAME', activation='leaky_relu', 
                          name='zernike_process1'),
+            layers.BatchNormalization(),
             layers.Conv2D(self.Zernike_chan, 3, padding='SAME', activation='leaky_relu', 
                          name='zernike_process2'),
         ], name='zernike_processor')
@@ -698,8 +702,10 @@ class FFPhaseCNN(Model):
         self.gabor_processor = tf.keras.Sequential([
             layers.BatchNormalization(name='gabor_bn'),
             layers.Conv2D(self.Gabor_chan, 1, activation='leaky_relu', kernel_initializer='he_normal', name='gabor_compress'),
+            layers.BatchNormalization(),
             layers.Conv2D(self.Gabor_chan, 3, padding='SAME', activation='leaky_relu', kernel_initializer = 'he_normal', 
                          name='gabor_process1'),
+            layers.BatchNormalization(),
             layers.Conv2D(self.Gabor_chan, 3, padding='SAME', activation='leaky_relu', kernel_initializer = 'he_normal', 
                          name='gabor_process2'),
         ], name='gabor_processor')
@@ -714,15 +720,16 @@ class FFPhaseCNN(Model):
 
         # extra prelaser downsample
         self.pre_laser_downsample = tf.keras.Sequential([
+            layers.BatchNormalization(),
             layers.Conv2D(self.Zernike_chan + self.Gabor_chan + self.Raw_chan, 3, strides = 2, padding = 'SAME', activation='leaky_relu', kernel_initializer = 'he_normal')
         ], name = 'pre_laser_downsample')
         
         #decodes each laser's values
         self.shared_decoder = tf.keras.Sequential([
             layers.Conv2D(64, 3, padding='SAME', activation='leaky_relu', kernel_initializer='he_normal'),
-            layers.BatchNormalization(),
+            layers.GroupNormalization(groups = 8, axis = -1),
             layers.Conv2D(32, 3, padding='SAME', activation='leaky_relu', kernel_initializer='he_normal'),
-            layers.BatchNormalization(),
+            layers.GroupNormalization(groups = 8, axis = -1),
             layers.Conv2D(16, 3, padding='SAME', activation='leaky_relu', kernel_initializer='he_normal'),
             layers.Conv2D(2, 3, padding='SAME'),
         ], name='shared_decoder')
@@ -772,7 +779,7 @@ class FFPhaseCNN(Model):
         return config
 
     def call(self, inputs, training = False):
-        down_inputs = self.i_downsample(inputs)
+        down_inputs = self.i_downsample(inputs, training = training)
         zernike_down = self.zernike_conv(inputs)
         gabor_down = self.gabor_conv(inputs)
 
@@ -794,13 +801,13 @@ class FFPhaseCNN(Model):
 
         # Early FiLM: content and position interact BEFORE downsampling/pooling.
         combined_tiled_full = self.film_early(combined_tiled_full, pos_encoded_flat)
-        combined_tiled_full = self.pre_laser_downsample(combined_tiled_full)  # now per-(B*L), not per-B
+        combined_tiled_full = self.pre_laser_downsample(combined_tiled_full, training = training)  # now per-(B*L), not per-B
 
         H, W, C = combined_tiled_full.shape[1], combined_tiled_full.shape[2], combined_tiled_full.shape[3]
 
         conditioned = self.film(combined_tiled_full, pos_encoded_flat)
         pooled = self.global_pool(conditioned)
-        coeffs = self.coeff_head(pooled)
+        coeffs = self.coeff_head(pooled, training = training)
         piston_coeff = coeffs[:, 0]
 
         phase_components = self.shared_decoder(conditioned, training=training)
@@ -816,6 +823,11 @@ class FFPhaseCNN(Model):
         predicted_phases = tf.reshape(phases_flat, [B, L])
 
         return predicted_phases
+
+    def build(self, input_shape):
+        dummy = tf.zeros(input_shape)
+        self.call(dummy, training=False)
+        super().build(input_shape)
 
 class DatasetStore:
     def __init__(self, h5_path, image_shape, num_channels, flush_count = 8, initial_size = 100):
@@ -942,7 +954,7 @@ def forward_pass(model, inputs):
 
 #learning rate schedule - Warmup
 class lr_warmup(tf.keras.optimizers.schedules.LearningRateSchedule):
-    def __init__(self, initial_learning_rate, flat_learning_rate, warmup_steps = 20):
+    def __init__(self, initial_learning_rate, flat_learning_rate, warmup_steps = 20, hold_steps = 80, decay_steps = 60):
         self.initial_learning_rate = initial_learning_rate
         self.flat_learning_rate = flat_learning_rate
         self.lr_diff = self.flat_learning_rate - self.initial_learning_rate
@@ -961,20 +973,42 @@ class lr_warmup(tf.keras.optimizers.schedules.LearningRateSchedule):
             }
 
 # Testing elements
-def linearity_test(sim):
-    z = sim.target_position[2]
-    sim.set_rel_phases()  # zero correction
-    combined_out, xo, yo = sim.fresnel_propagation(sim.input_e_quick(), z)
+def grad_extremes(named_grads):
+    """named_grads: list of (var_name, grad_tensor) pairs"""
+    raw = [(name, float(tf.norm(g))) for name, g in named_grads]
+    max_name, grad_max = max(raw, key=lambda x: x[1])
+    min_name, grad_min = min(raw, key=lambda x: x[1])
+    return max_name, grad_max, min_name, grad_min
 
-    summed = np.zeros_like(combined_out)
-    for base in sim.base_fields:
-        out_n, _, _ = sim.fresnel_propagation(base, z)
-        summed += out_n
+def grad_rms(named_grads):
+    return [(name, float(tf.norm(g)) / (float(tf.size(g)) ** 0.5)) for name, g in named_grads]
 
-    diff = combined_out - summed
-    print("max |combined|:  ", np.max(np.abs(combined_out)))
-    print("max |diff|:      ", np.max(np.abs(diff)))
-    print("relative error:  ", np.max(np.abs(diff)) / np.max(np.abs(combined_out)))
+def update_to_weight_ratio(named_grads, variables_by_name, lr):
+    ratios = []
+    for name, g in named_grads:
+        w = variables_by_name[name]
+        w_norm = float(tf.norm(w))
+        g_norm = float(tf.norm(g))
+        ratio = (lr * g_norm) / (w_norm + 1e-12)
+        ratios.append((name, ratio))
+    return ratios
+
+def classify(name):
+    n = name.lower()
+    if 'gamma' in n or 'beta' in n:
+        return 'norm_scale_shift'
+    if 'kernel' in n:
+        return 'conv_or_dense_weight'
+    if 'bias' in n:
+        return 'bias'
+    return 'other'
+
+from collections import defaultdict
+def grouped_ratio_summary(ratios):
+    groups = defaultdict(list)
+    for name, r in ratios:
+        groups[classify(name)].append(r)
+    return {g: (min(v), max(v), sum(v)/len(v)) for g, v in groups.items()}
 
 def circular_phase_loss(y_true, y_pred):
     # Normalize both to [-π, π] first
@@ -1069,8 +1103,8 @@ if choice == 'lr_range_test':
             with tf.GradientTape() as tape:
                 predicted_phases = model(images, training=True)
                 loss = circular_phase_loss(labels, predicted_phases)
-            grads = tape.gradient(loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            grads = tape.gradient(loss, all_vars)
+            optimizer.apply_gradients(zip(grads, all_vars))
             losses.append(float(loss))
             print(Timer.elapsed())
         return lrs, losses
@@ -1162,24 +1196,40 @@ if choice == "training":
         element_positions=outer_positions,
     )
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate = lr_warmup(1e-7, 1e-3, 20), clipnorm = 0.5, beta_1 = 0.9, beta_2 = 0.98, epsilon = 1e-8)
-
-    @tf.function
-    def train_step(images, labels):
-        with tf.GradientTape() as tape:
-            predicted_phases = model(images, training = True)
-            loss = circular_phase_loss(labels, predicted_phases)
-        grads = tape.gradient(loss, model.trainable_variables)
-        optimizer.apply_gradients(zip(grads, model.trainable_variables))
-        return loss
     best_val_loss = float('inf')
 
     #Single Batch training test 
     images, labels = next(iter(train_ds))  # same fixed batch every step
+    model.build(input_shape=(1, grid_size, grid_size, 1))
+    gain_layers = [model.film_early.mlp.layers[-1], model.film.mlp.layers[-1]]
+    gain_var_ids = set()
+    gain_vars = []
+    for layer in gain_layers:
+        for v in layer.trainable_variables:
+            gain_vars.append(v)
+            gain_var_ids.add(id(v))
+    norm_vars, other_vars = [], []
+    for v in model.trainable_variables:
+        if id(v) in gain_var_ids:
+            continue  # handled below, folded into norm_vars
+        if classify(v.name) == 'norm_scale_shift':
+            norm_vars.append(v)
+        else:
+            other_vars.append(v)
+    norm_vars = norm_vars + gain_vars
+    main_lr = lr_warmup(1e-7, 2.0e-3, warmup_steps=20)
+    norm_lr = lr_warmup(1e-7, 1e-4, warmup_steps=20)
+
+    optimizer_main = tf.keras.optimizers.Adam(
+        learning_rate=main_lr, clipnorm=0.5, beta_1=0.9, beta_2=0.99, epsilon=1e-8
+    )
+    optimizer_norm = tf.keras.optimizers.Adam(
+        learning_rate=norm_lr, clipnorm=0.2, beta_1=0.9, beta_2=0.995, epsilon=1e-8
+    )
     csv_file = csv_writer = None
     print("test begin")
-    log_path='outputs/overfit_logs/warmup_b098_c05_lr0_001.csv'
-    run_label='warmup_beta098_clip05_lr0_001'
+    log_path='outputs/overfit_logs/batch_b0995_c05_lr_002_separate.csv'
+    run_label='batch_b0995_clip05_lr_002_separate'
 
     if log_path is not None:
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1187,37 +1237,75 @@ if choice == "training":
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
             'run_label', 'timestamp', 'step', 'loss',
-            'grad_norm_min', 'grad_norm_max', 'none_grads', 'learning_rate'
+            'grad_norm_min', 'grad_norm_max', 'none_grads', 'learning_rate',
+            'min_name', 'max_name',
+            'conv_ratio_min', 'conv_ratio_max', 'conv_ratio_mean',
+            'norm_ratio_min', 'norm_ratio_max', 'norm_ratio_mean',
+            'bias_ratio_min', 'bias_ratio_max', 'bias_ratio_mean',
         ])
     
-    for step in range(151):
+    for step in range(301):
         with tf.GradientTape() as tape:
             predicted_phases = model(images, training=True)
             loss = circular_phase_loss(labels, predicted_phases)
-        grads = tape.gradient(loss, model.trainable_variables)
-        # check for dead/vanishing gradients directly
-        grad_norms = [tf.norm(g).numpy() for g in grads if g is not None]
-        none_grads = sum(1 for g in grads if g is None)
-        optimizer.apply_gradients(zip(grads, model.trainable_variables))
-        lr = optimizer.learning_rate
-        current_lr = float(lr(optimizer.iterations)) if callable(lr) else float(lr)
+        all_vars = norm_vars + other_vars
+        grads = tape.gradient(loss, all_vars)
 
+        norm_grads = grads[:len(norm_vars)]
+        other_grads = grads[len(norm_vars):]
+
+        named_grads = [(v.name, g) for v, g in zip(all_vars, grads) if g is not None]
+        none_grads = sum(1 for g in grads if g is None)
+        max_name, grad_max, min_name, grad_min = grad_extremes(named_grads)
+
+        optimizer_main.apply_gradients(
+            (g, v) for g, v in zip(other_grads, other_vars) if g is not None
+        )
+        optimizer_norm.apply_gradients(
+            (g, v) for g, v in zip(norm_grads, norm_vars) if g is not None
+        )
+
+        lr = optimizer_main.learning_rate
+        current_lr = float(lr(optimizer_main.iterations)) if callable(lr) else float(lr)
+        norm_lr_val = float(norm_lr(optimizer_norm.iterations))
         loss_val = float(loss)
-        grad_min = min(grad_norms) if grad_norms else float('nan')
-        grad_max = max(grad_norms) if grad_norms else float('nan')
+        variables_by_name = {v.name: v for v in all_vars}
+        norm_var_names = {v.name for v in norm_vars}
+
+        if step % 10 == 0:
+            ratios_main = update_to_weight_ratio(
+                [(name, g) for name, g in named_grads if name not in norm_var_names],
+                variables_by_name, current_lr
+            )
+            ratios_norm = update_to_weight_ratio(
+                [(name, g) for name, g in named_grads if name in norm_var_names],
+                variables_by_name, norm_lr_val
+            )
+            ratios = ratios_main + ratios_norm
+            summary = grouped_ratio_summary(ratios)
+            conv = summary.get('conv_or_dense_weight', (float('nan'),) * 3)
+            norm = summary.get('norm_scale_shift', (float('nan'),) * 3)
+            bias = summary.get('bias', (float('nan'),) * 3)
+        else:
+            conv = norm = bias = (float('nan'),) * 3   # keep row width consistent; not recomputed every step
 
         if csv_writer is not None:
             csv_writer.writerow([
                 run_label, datetime.now().isoformat(timespec='seconds'),
-                step, loss_val, grad_min, grad_max, none_grads, current_lr
+                step, loss_val, grad_min, grad_max, none_grads, current_lr,
+                min_name, max_name,
+                conv[0], conv[1], conv[2],
+                norm[0], norm[1], norm[2],
+                bias[0], bias[1], bias[2],
             ])
             if step % 10 == 0:
-                csv_file.flush()  # periodic flush so a crash doesn't lose the whole file
+                csv_file.flush()
 
         if step % 10 == 0:
             print(f"step {step}: loss={loss_val:.4f}  "
-                  f"grad_norm_min={grad_min:.2e}  grad_norm_max={grad_max:.2e}  "
-                  f"none_grads={none_grads}  lr={current_lr:.2e}")
+                f"grad_min={grad_min:.2e} ({min_name})  grad_max={grad_max:.2e} ({max_name})  "
+                f"conv_ratio=[{conv[0]:.1e}, {conv[1]:.1e}]  norm_ratio=[{norm[0]:.1e}, {norm[1]:.1e}]  "
+                f"bias_ratio=[{bias[0]:.1e}, {bias[1]:.1e}]")
 
     if csv_file is not None:
         csv_file.close()
