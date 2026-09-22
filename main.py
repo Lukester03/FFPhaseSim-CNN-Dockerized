@@ -23,8 +23,11 @@ import matplotlib.pyplot as plt
 from scipy.signal import CZT
 from numpy.fft import fft2, ifft2
 
-tf.config.threading.set_intra_op_parallelism_threads(16)
+np.random.seed(42)
+tf.config.experimental.enable_op_determinism()
+tf.config.threading.set_intra_op_parallelism_threads(32)
 tf.random.set_seed(42)
+tf.keras.utils.set_random_seed(42)
 
 class timer_class:
     def __init__(self):
@@ -726,7 +729,7 @@ class FFPhaseCNN(Model):
         
         #decodes each laser's values
         self.shared_decoder = tf.keras.Sequential([
-            layers.Conv2D(64, 3, padding='SAME', activation='leaky_relu', kernel_initializer='he_normal'),
+            layers.Conv2D(64, 3, padding='SAME', activation='leaky_relu', kernel_initializer='he_normal', strides = 2),
             layers.GroupNormalization(groups = 8, axis = -1),
             layers.Conv2D(32, 3, padding='SAME', activation='leaky_relu', kernel_initializer='he_normal'),
             layers.GroupNormalization(groups = 8, axis = -1),
@@ -743,7 +746,6 @@ class FFPhaseCNN(Model):
         ], name = 'coeff_head')
 
         pos_dim = 2 + 4 * 6  # matches sinusoidal_position_encoding defaults
-        self.film_early = FiLMConditioner(self.Zernike_chan + self.Gabor_chan + self.Raw_chan, pos_dim, name="film_early")
         self.film = FiLMConditioner(self.Zernike_chan + self.Gabor_chan + self.Raw_chan, pos_dim, name="film_late")
         self.global_pool = layers.GlobalAveragePooling2D()
 
@@ -788,6 +790,7 @@ class FFPhaseCNN(Model):
         i_features = self.intensity_processor(down_inputs, training=training)
 
         combined = tf.concat([z_features, g_features, i_features], axis=-1)  # [B, H, W, C]
+        combined = self.pre_laser_downsample(combined, training = training)
         B = tf.shape(inputs)[0]
         L = self.num_lasers
         pos_all = tf.constant(self.element_positions[:, :2], dtype=tf.float32)
@@ -798,12 +801,6 @@ class FFPhaseCNN(Model):
         Hc, Wc, Cc = combined.shape[1], combined.shape[2], combined.shape[3]
         combined_tiled_full = tf.repeat(combined[:, None, ...], L, axis=1)
         combined_tiled_full = tf.reshape(combined_tiled_full, [B * L, Hc, Wc, Cc])
-
-        # Early FiLM: content and position interact BEFORE downsampling/pooling.
-        combined_tiled_full = self.film_early(combined_tiled_full, pos_encoded_flat)
-        combined_tiled_full = self.pre_laser_downsample(combined_tiled_full, training = training)  # now per-(B*L), not per-B
-
-        H, W, C = combined_tiled_full.shape[1], combined_tiled_full.shape[2], combined_tiled_full.shape[3]
 
         conditioned = self.film(combined_tiled_full, pos_encoded_flat)
         pooled = self.global_pool(conditioned)
@@ -894,7 +891,7 @@ class DatasetStore:
 
         indices = np.arange(n_total)
         if shuffle:
-            rng = np.random.default_rng()
+            rng = np.random.default_rng(42)
             rng.shuffle(indices)
         n_val = int(n_total * val_split)
         val_idx, train_idx = indices[:n_val], indices[n_val:]
@@ -929,7 +926,7 @@ class DatasetStore:
             ds = tf.data.Dataset.from_tensor_slices((all_images, all_labels))
             ds = ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
             if training:
-                ds = ds.shuffle(1024)
+                ds = ds.shuffle(1024, seed=42, reshuffle_each_iteration=False)
             ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
             return ds
 
@@ -973,25 +970,37 @@ class lr_warmup(tf.keras.optimizers.schedules.LearningRateSchedule):
             }
 
 # Testing elements
-def grad_extremes(named_grads):
-    """named_grads: list of (var_name, grad_tensor) pairs"""
-    raw = [(name, float(tf.norm(g))) for name, g in named_grads]
-    max_name, grad_max = max(raw, key=lambda x: x[1])
-    min_name, grad_min = min(raw, key=lambda x: x[1])
-    return max_name, grad_max, min_name, grad_min
+def ratios_from_norms(names, grad_norms, variables, lr):
+    """names/grad_norms/variables are all aligned by position."""
+    out = []
+    for name, g_norm, v in zip(names, grad_norms, variables):
+        w_norm = float(tf.norm(v))
+        out.append((name, (lr * float(g_norm)) / (w_norm + 1e-12)))
+    return out
 
-def grad_rms(named_grads):
-    return [(name, float(tf.norm(g)) / (float(tf.size(g)) ** 0.5)) for name, g in named_grads]
-
-def update_to_weight_ratio(named_grads, variables_by_name, lr):
-    ratios = []
-    for name, g in named_grads:
-        w = variables_by_name[name]
-        w_norm = float(tf.norm(w))
-        g_norm = float(tf.norm(g))
-        ratio = (lr * g_norm) / (w_norm + 1e-12)
-        ratios.append((name, ratio))
-    return ratios
+def build_variable_groups(model):
+    """Returns (norm_vars, other_vars, all_vars, all_names, n_norm)."""
+    gain_layers = [model.film.mlp.layers[-1]]
+    gain_var_ids = set()
+    gain_vars = []
+    for layer in gain_layers:
+        for v in layer.trainable_variables:
+            gain_vars.append(v)
+            gain_var_ids.add(id(v))
+ 
+    norm_vars, other_vars = [], []
+    for v in model.trainable_variables:
+        if id(v) in gain_var_ids:
+            continue                      # folded in below
+        if classify(v.name) == 'norm_scale_shift':
+            norm_vars.append(v)
+        else:
+            other_vars.append(v)
+    norm_vars = norm_vars + gain_vars
+ 
+    all_vars = norm_vars + other_vars
+    all_names = [v.name for v in all_vars]
+    return norm_vars, other_vars, all_vars, all_names, len(norm_vars)
 
 def classify(name):
     n = name.lower()
@@ -1088,7 +1097,20 @@ if __name__ == "__main__":
     -cnn 
     -opt_diagnostics 
     -bottleneck
-    -lr_range_test\n""")
+    -lr_range_test
+    -randomize_test\n""")
+
+if choice == 'randomize_test':
+    grid_size = 1024
+    array = ArrayDesign(2, 'hex')
+    element_positions = array.arrayvector
+    center_idx = array.find_center_index()
+    outer_positions = np.delete(element_positions, center_idx, axis=0)
+    np.random.seed(42)
+    tf.random.set_seed(42)
+    model = FFPhaseCNN(laser_count=outer_positions.shape[0], element_positions=outer_positions)
+    model.build(input_shape=(1, grid_size, grid_size, 1))
+    print(float(tf.norm(model.film.mlp.layers[-1].kernel)))
 
 if choice == 'lr_range_test':
     def lr_range_test(model_fn, train_ds, start_lr=1e-5, end_lr=1e-2, num_steps=100):
@@ -1117,36 +1139,6 @@ if choice == 'lr_range_test':
     lrs, losses = lr_range_test(lambda: FFPhaseCNN(laser_count=outer_positions.shape[0], element_positions=outer_positions), train_ds)
     for lr, loss in zip(lrs, losses):
         print(f"{lr:.2e}: {loss:.4f}")
-
-if choice == 'bottleneck':
-    model = FFPhaseCNN()
-    inputs = tf.random.normal((1, 1024, 1024, 1))
-    _ = forward_pass(model=model, inputs=inputs)   # warm up / trace once, discard
-
-    def timeit(fn, n=20):
-        t0 = Timer.elapsed()
-        for _ in range(n):
-            out = fn()
-        return (Timer.elapsed() - t0) / n, out
-
-    down_t, down_inputs = timeit(lambda: model.i_downsample(inputs))
-    zern_t, zernike_raw = timeit(lambda: model.zernike_conv(inputs))
-    gabor_t, gabor_raw = timeit(lambda: model.gabor_conv(inputs))
-    zproc_t, z_features = timeit(lambda: model.zernike_processor(zernike_raw, training=False))
-    gproc_t, g_features = timeit(lambda: model.gabor_processor(gabor_raw, training=False))
-    iproc_t, i_features = timeit(lambda: model.intensity_processor(down_inputs, training=False))
-    combined = tf.concat([z_features, g_features, i_features], axis=-1)
-    full_t, _ = timeit(lambda: forward_pass(model=model, inputs=inputs))
-
-    print(f"downsample:     {down_t:.4f}s")
-    print(f"zernike_conv:   {zern_t:.4f}s")
-    print(f"gabor_conv:     {gabor_t:.4f}s")
-    print(f"zernike_proc:   {zproc_t:.4f}s")
-    print(f"gabor_proc:     {gproc_t:.4f}s")
-    print(f"intensity_proc: {iproc_t:.4f}s")
-    print(f"sum of above:   {down_t+zern_t+gabor_t+zproc_t+gproc_t+iproc_t:.4f}s")
-    print(f"full forward:   {full_t:.4f}s")
-    print(f"laser-loop portion (full minus sum): {full_t - (down_t+zern_t+gabor_t+zproc_t+gproc_t+iproc_t):.4f}s")
 
 #looking at testing data
 if choice == "h5":
@@ -1188,49 +1180,63 @@ if choice == "training":
     element_positions = array.arrayvector   # shape (7, 3) — same source of truth as compute_optimal_phases
     center_idx = array.find_center_index()
     outer_positions = np.delete(element_positions, center_idx, axis=0)
-
+    # setting up CNN model and dataset
     train_ds, val_ds, grid_size, norm_scale = DatasetStore.make_dataset('testtrainingdata.h5', batch_size=32)
-
     model = FFPhaseCNN(
         laser_count=outer_positions.shape[0],
         element_positions=outer_positions,
     )
-
-    best_val_loss = float('inf')
-
-    #Single Batch training test 
-    images, labels = next(iter(train_ds))  # same fixed batch every step
-    model.build(input_shape=(1, grid_size, grid_size, 1))
-    gain_layers = [model.film_early.mlp.layers[-1], model.film.mlp.layers[-1]]
-    gain_var_ids = set()
-    gain_vars = []
-    for layer in gain_layers:
-        for v in layer.trainable_variables:
-            gain_vars.append(v)
-            gain_var_ids.add(id(v))
-    norm_vars, other_vars = [], []
-    for v in model.trainable_variables:
-        if id(v) in gain_var_ids:
-            continue  # handled below, folded into norm_vars
-        if classify(v.name) == 'norm_scale_shift':
-            norm_vars.append(v)
-        else:
-            other_vars.append(v)
-    norm_vars = norm_vars + gain_vars
+    # optimizer settings and learning rates
     main_lr = lr_warmup(1e-7, 2.0e-3, warmup_steps=20)
     norm_lr = lr_warmup(1e-7, 1e-4, warmup_steps=20)
-
     optimizer_main = tf.keras.optimizers.Adam(
         learning_rate=main_lr, clipnorm=0.5, beta_1=0.9, beta_2=0.99, epsilon=1e-8
     )
     optimizer_norm = tf.keras.optimizers.Adam(
         learning_rate=norm_lr, clipnorm=0.2, beta_1=0.9, beta_2=0.995, epsilon=1e-8
     )
-    csv_file = csv_writer = None
-    print("test begin")
-    log_path='outputs/overfit_logs/batch_b0995_c05_lr_002_separate.csv'
-    run_label='batch_b0995_clip05_lr_002_separate'
+    best_val_loss = float('inf')
 
+    #Single Batch training test 
+    data = np.load('outputs/fixed_overfit_batch.npz')
+    images, labels = tf.constant(data['images']), tf.constant(data['labels'])
+    model.build(input_shape=(1, grid_size, grid_size, 1))
+    gain_layers = [model.film.mlp.layers[-1]]
+    gain_var_ids = set()
+    gain_vars = []
+    for layer in gain_layers:
+        for v in layer.trainable_variables:
+            gain_vars.append(v)
+            gain_var_ids.add(id(v))
+    dense_4_kernel = gain_layers[0].kernel
+    dense_4_bias = gain_layers[0].bias
+
+    norm_vars, other_vars = [], []
+    for v in model.trainable_variables:
+        if id(v) in gain_var_ids:
+            continue
+        if classify(v.name) == 'norm_scale_shift':
+            norm_vars.append(v)
+        else:
+            other_vars.append(v)
+    norm_vars = norm_vars + gain_vars
+
+    csv_file = csv_writer = None
+    log_path='outputs/overfit_logs/batch_b0995_c05_lr_002_mod3.csv'
+    run_label='batch_b0995_clip05_lr_002_mod3'
+    all_vars = norm_vars + other_vars
+    all_names = [v.name for v in all_vars]
+    n_norm = len(norm_vars)
+
+    norm_idx = list(range(n_norm))
+    main_idx = list(range(n_norm, len(all_vars)))
+
+    norm_names = all_names[:n_norm]
+    norm_vars_sliced = all_vars[:n_norm]
+    main_names = all_names[n_norm:]
+    main_vars = all_vars[n_norm:]
+
+    #diagnostic overfit CSV generation
     if log_path is not None:
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         csv_file = open(log_path, mode='w', newline='')
@@ -1242,79 +1248,13 @@ if choice == "training":
             'conv_ratio_min', 'conv_ratio_max', 'conv_ratio_mean',
             'norm_ratio_min', 'norm_ratio_max', 'norm_ratio_mean',
             'bias_ratio_min', 'bias_ratio_max', 'bias_ratio_mean',
+            'gain_kernel_norm', 'gain_bias_norm',
         ])
-    
-    for step in range(301):
-        with tf.GradientTape() as tape:
-            predicted_phases = model(images, training=True)
-            loss = circular_phase_loss(labels, predicted_phases)
-        all_vars = norm_vars + other_vars
-        grads = tape.gradient(loss, all_vars)
 
-        norm_grads = grads[:len(norm_vars)]
-        other_grads = grads[len(norm_vars):]
-
-        named_grads = [(v.name, g) for v, g in zip(all_vars, grads) if g is not None]
-        none_grads = sum(1 for g in grads if g is None)
-        max_name, grad_max, min_name, grad_min = grad_extremes(named_grads)
-
-        optimizer_main.apply_gradients(
-            (g, v) for g, v in zip(other_grads, other_vars) if g is not None
-        )
-        optimizer_norm.apply_gradients(
-            (g, v) for g, v in zip(norm_grads, norm_vars) if g is not None
-        )
-
-        lr = optimizer_main.learning_rate
-        current_lr = float(lr(optimizer_main.iterations)) if callable(lr) else float(lr)
-        norm_lr_val = float(norm_lr(optimizer_norm.iterations))
-        loss_val = float(loss)
-        variables_by_name = {v.name: v for v in all_vars}
-        norm_var_names = {v.name for v in norm_vars}
-
-        if step % 10 == 0:
-            ratios_main = update_to_weight_ratio(
-                [(name, g) for name, g in named_grads if name not in norm_var_names],
-                variables_by_name, current_lr
-            )
-            ratios_norm = update_to_weight_ratio(
-                [(name, g) for name, g in named_grads if name in norm_var_names],
-                variables_by_name, norm_lr_val
-            )
-            ratios = ratios_main + ratios_norm
-            summary = grouped_ratio_summary(ratios)
-            conv = summary.get('conv_or_dense_weight', (float('nan'),) * 3)
-            norm = summary.get('norm_scale_shift', (float('nan'),) * 3)
-            bias = summary.get('bias', (float('nan'),) * 3)
-        else:
-            conv = norm = bias = (float('nan'),) * 3   # keep row width consistent; not recomputed every step
-
-        if csv_writer is not None:
-            csv_writer.writerow([
-                run_label, datetime.now().isoformat(timespec='seconds'),
-                step, loss_val, grad_min, grad_max, none_grads, current_lr,
-                min_name, max_name,
-                conv[0], conv[1], conv[2],
-                norm[0], norm[1], norm[2],
-                bias[0], bias[1], bias[2],
-            ])
-            if step % 10 == 0:
-                csv_file.flush()
-
-        if step % 10 == 0:
-            print(f"step {step}: loss={loss_val:.4f}  "
-                f"grad_min={grad_min:.2e} ({min_name})  grad_max={grad_max:.2e} ({max_name})  "
-                f"conv_ratio=[{conv[0]:.1e}, {conv[1]:.1e}]  norm_ratio=[{norm[0]:.1e}, {norm[1]:.1e}]  "
-                f"bias_ratio=[{bias[0]:.1e}, {bias[1]:.1e}]")
-
-    if csv_file is not None:
-        csv_file.close()
-    exit()
-    #normally implemented training
     for epoch in range(num_epochs):
         epoch_losses = []
-        for images, labels in train_ds:
-            loss = train_step(images, labels)
+        for images, labels in images, labels:
+            loss = 0
             epoch_losses.append(loss)
         val_losses = [circular_phase_loss(label, model(im, training=False)) for im, label in val_ds]
         avg_val_loss = np.mean(val_losses)
@@ -1449,3 +1389,258 @@ if choice == 'label_div':
     print("per-channel std:", np.std(all_labels, axis=0))
     print("per-channel range:", np.ptp(all_labels, axis=0))
     print("per-channel mean:", np.mean(all_labels, axis=0))
+
+if choice == "long_overfit":
+    TOTAL_STEPS      = 6000
+    RATIO_EVERY      = 50       # ratio diagnostics cadence
+    CHECKPOINT_EVERY = 250      # weight snapshot cadence
+    PRINT_EVERY      = 50
+ 
+    array = ArrayDesign(2, 'hex')
+    center_idx = array.find_center_index()
+    outer_positions = np.delete(array.arrayvector, center_idx, axis=0)
+ 
+    # grid_size is needed for model.build(); read it from the saved batch so we
+    # never touch the dataset pipeline (and its RNG) in this branch at all.
+    data = np.load('outputs/fixed_overfit_batch.npz')
+    images = tf.constant(data['images'])
+    labels = tf.constant(data['labels'])
+    grid_size = int(images.shape[1])
+    print(f"loaded fixed batch: images={images.shape}, labels={labels.shape}")
+ 
+    model = FFPhaseCNN(
+        laser_count=outer_positions.shape[0],
+        element_positions=outer_positions,
+    )
+    model.build(input_shape=(1, grid_size, grid_size, 1))
+ 
+    norm_vars, other_vars, all_vars, all_names, n_norm = build_variable_groups(model)
+ 
+    norm_idx = list(range(n_norm))
+    main_idx = list(range(n_norm, len(all_vars)))
+    norm_names, norm_vars_sliced = all_names[:n_norm], all_vars[:n_norm]
+    main_names, main_vars = all_names[n_norm:], all_vars[n_norm:]
+ 
+    gain_kernel = model.film.mlp.layers[-1].kernel
+    gain_bias   = model.film.mlp.layers[-1].bias
+ 
+    # ---- mod1 settings ----------------------------------------------------
+    main_lr = lr_warmup(1e-7, 2.0e-3, warmup_steps=20)
+    norm_lr = lr_warmup(1e-7, 3.0e-5, warmup_steps=20)   # the mod1 cut
+ 
+    optimizer_main = tf.keras.optimizers.Adam(
+        learning_rate=main_lr, clipnorm=0.5, beta_1=0.9, beta_2=0.99, epsilon=1e-8
+    )
+    optimizer_norm = tf.keras.optimizers.Adam(
+        learning_rate=norm_lr, clipnorm=0.2, beta_1=0.9, beta_2=0.995, epsilon=1e-8
+    )
+ 
+    @tf.function
+    def train_step(images, labels):
+        with tf.GradientTape() as tape:
+            predicted_phases = model(images, training=True)
+            loss = circular_phase_loss(labels, predicted_phases)
+        grads = tape.gradient(loss, all_vars)
+        optimizer_main.apply_gradients(zip(grads[n_norm:], other_vars))
+        optimizer_norm.apply_gradients(zip(grads[:n_norm], norm_vars))
+        return loss, tf.stack([tf.norm(g) for g in grads])
+ 
+    # ---- logging ----------------------------------------------------------
+    log_path   = 'outputs/overfit_logs/long_overfit_mod2.csv'
+    ckpt_dir   = 'outputs/long_overfit_ckpts2'
+    run_label  = 'long_overfit_mod2'
+    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+ 
+    csv_file = open(log_path, mode='w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow([
+        'run_label', 'timestamp', 'step', 'loss', 'best_loss',
+        'grad_norm_min', 'grad_norm_max', 'min_name', 'max_name',
+        'learning_rate', 'norm_learning_rate',
+        'conv_ratio_min', 'conv_ratio_max', 'conv_ratio_mean',
+        'norm_ratio_min', 'norm_ratio_max', 'norm_ratio_mean',
+        'bias_ratio_min', 'bias_ratio_max', 'bias_ratio_mean',
+        'gain_kernel_norm', 'gain_bias_norm',
+    ])
+ 
+    best_loss = float('inf')
+    print(f"long overfit begin — {TOTAL_STEPS} steps")
+ 
+    for step in range(TOTAL_STEPS):
+        loss, grad_norms = train_step(images, labels)
+ 
+        gn = grad_norms.numpy()
+        loss_val = float(loss)
+        max_i, min_i = int(gn.argmax()), int(gn.argmin())
+        grad_max, max_name = float(gn[max_i]), all_names[max_i]
+        grad_min, min_name = float(gn[min_i]), all_names[min_i]
+ 
+        gain_kernel_norm = float(tf.norm(gain_kernel))
+        gain_bias_norm   = float(tf.norm(gain_bias))
+ 
+        current_lr  = float(main_lr(optimizer_main.iterations))
+        norm_lr_val = float(norm_lr(optimizer_norm.iterations))
+ 
+        # best-so-far checkpoint: survives a late divergence
+        if loss_val < best_loss:
+            best_loss = loss_val
+            model.save_weights(f'{ckpt_dir}/best.weights.h5')
+ 
+        # periodic snapshot: survives a crash
+        if step % CHECKPOINT_EVERY == 0:
+            model.save_weights(f'{ckpt_dir}/step_{step:05d}.weights.h5')
+ 
+        if step % RATIO_EVERY == 0:
+            ratios = (ratios_from_norms(main_names, gn[main_idx], main_vars, current_lr)
+                      + ratios_from_norms(norm_names, gn[norm_idx], norm_vars_sliced, norm_lr_val))
+            summary = grouped_ratio_summary(ratios)
+            conv = summary.get('conv_or_dense_weight', (float('nan'),) * 3)
+            norm = summary.get('norm_scale_shift', (float('nan'),) * 3)
+            bias = summary.get('bias', (float('nan'),) * 3)
+        else:
+            conv = norm = bias = (float('nan'),) * 3
+ 
+        csv_writer.writerow([
+            run_label, datetime.now().isoformat(timespec='seconds'),
+            step, loss_val, best_loss,
+            grad_min, grad_max, min_name, max_name,
+            current_lr, norm_lr_val,
+            conv[0], conv[1], conv[2],
+            norm[0], norm[1], norm[2],
+            bias[0], bias[1], bias[2],
+            gain_kernel_norm, gain_bias_norm,
+        ])
+        csv_file.flush()          # every step — a crash at hour 40 loses nothing
+ 
+        if step % PRINT_EVERY == 0:
+            print(f"step {step}: loss={loss_val:.4f}  best={best_loss:.4f}  "
+                  f"grad_max={grad_max:.2e} ({max_name})  "
+                  f"conv_ratio={conv[2]:.1e}  norm_ratio={norm[2]:.1e}  "
+                  f"w7={gain_kernel_norm:.5f}  t={Timer.elapsed()/3600:.2f}h",
+                  flush=True)
+ 
+    csv_file.close()
+    print(f"done. best loss: {best_loss:.4f}  ->  {ckpt_dir}/best.weights.h5")
+
+if choice == "bottleneck":
+    batch = int(input("Batch size to profile? (1 for per-sample, 32 for training-realistic)\n"))
+ 
+    array = ArrayDesign(2, 'hex')
+    center_idx = array.find_center_index()
+    outer_positions = np.delete(array.arrayvector, center_idx, axis=0)
+ 
+    model = FFPhaseCNN(
+        laser_count=outer_positions.shape[0],
+        element_positions=outer_positions,
+    )
+    model.build(input_shape=(1, 1024, 1024, 1))
+    norm_vars, other_vars, all_vars, all_names, n_norm = build_variable_groups(model)
+ 
+    inputs = tf.random.normal((batch, 1024, 1024, 1))
+    L = model.num_lasers
+ 
+    # ---- every stage traced --------
+    @tf.function
+    def f_downsample(x):      return model.i_downsample(x, training=False)
+    @tf.function
+    def f_zernike_conv(x):    return model.zernike_conv(x)
+    @tf.function
+    def f_gabor_conv(x):      return model.gabor_conv(x)
+    @tf.function
+    def f_zernike_proc(x):    return model.zernike_processor(x, training=False)
+    @tf.function
+    def f_gabor_proc(x):      return model.gabor_processor(x, training=False)
+    @tf.function
+    def f_intensity_proc(x):  return model.intensity_processor(x, training=False)
+ 
+    @tf.function
+    def f_tile(combined):
+        B = tf.shape(combined)[0]
+        pos_all = tf.constant(model.element_positions[:, :2], dtype=tf.float32)
+        pos_encoded = model.sinusoidal_position_encoding(pos_all)
+        pos_flat = tf.reshape(tf.tile(pos_encoded[None, ...], [B, 1, 1]), [B * L, -1])
+        Hc, Wc, Cc = combined.shape[1], combined.shape[2], combined.shape[3]
+        tiled = tf.repeat(combined[:, None, ...], L, axis=1)
+        tiled = tf.reshape(tiled, [B * L, Hc, Wc, Cc])
+        return tiled, pos_flat
+ 
+    @tf.function
+    def f_pre_laser(x):                 return model.pre_laser_downsample(x, training=False)
+    @tf.function
+    def f_film_late(x, pos_flat):       return model.film(x, pos_flat)
+    @tf.function
+    def f_coeff_head(x):                return model.coeff_head(model.global_pool(x), training=False)
+    @tf.function
+    def f_decoder(x):                   return model.shared_decoder(x, training=False)
+ 
+    @tf.function
+    def f_forward(x):
+        return model(x, training=False)
+ 
+    @tf.function
+    def f_train_step(x, labels):
+        with tf.GradientTape() as tape:
+            pred = model(x, training=True)
+            loss = circular_phase_loss(labels, pred)
+        return tape.gradient(loss, all_vars)
+ 
+    def timeit(fn, n=10):
+        out = fn()                                   # warm up / trace, discard
+        t0 = Timer.elapsed()
+        for _ in range(n):
+            out = fn()
+        return (Timer.elapsed() - t0) / n, out
+ 
+    # ---- feature-extraction stages ---------------------------------------
+    down_t,   down_inputs = timeit(lambda: f_downsample(inputs))
+    zern_t,   zernike_raw = timeit(lambda: f_zernike_conv(inputs))
+    gabor_t,  gabor_raw   = timeit(lambda: f_gabor_conv(inputs))
+    zproc_t,  z_features  = timeit(lambda: f_zernike_proc(zernike_raw))
+    gproc_t,  g_features  = timeit(lambda: f_gabor_proc(gabor_raw))
+    iproc_t,  i_features  = timeit(lambda: f_intensity_proc(down_inputs))
+ 
+    combined = tf.concat([z_features, g_features, i_features], axis=-1)
+ 
+    # ---- laser-tiled stages ----------------------------------------------
+    prelas_t, downsampled = timeit(lambda: f_pre_laser(combined))
+    tile_t,   tiled_pair  = timeit(lambda: f_tile(downsampled))
+    tiled, pos_flat = tiled_pair
+    flate_t,  conditioned = timeit(lambda: f_film_late(tiled, pos_flat))
+    coeff_t,  _           = timeit(lambda: f_coeff_head(conditioned))
+    dec_t,    _           = timeit(lambda: f_decoder(conditioned))
+ 
+    # ---- whole-model forward and backward --------------------------------
+    labels = tf.zeros((batch, L), dtype=tf.float32)
+    full_t, _ = timeit(lambda: f_forward(inputs))
+    step_t, _ = timeit(lambda: f_train_step(inputs, labels), n=5)
+ 
+    feature_sum = down_t + zern_t + gabor_t + zproc_t + gproc_t + iproc_t
+    laser_sum = tile_t + prelas_t + flate_t + coeff_t + dec_t
+ 
+    print(f"\n--- batch size {batch}, all stages graph-traced ---")
+    print(f"tiled tensor shape after repeat: {tiled.shape}  "
+          f"({np.prod(tiled.shape) * 4 / 1e9:.2f} GB in float32)\n")
+ 
+    print("feature extraction:")
+    print(f"  i_downsample:         {down_t:.4f}s")
+    print(f"  zernike_conv:         {zern_t:.4f}s")
+    print(f"  gabor_conv:           {gabor_t:.4f}s")
+    print(f"  zernike_processor:    {zproc_t:.4f}s")
+    print(f"  gabor_processor:      {gproc_t:.4f}s")
+    print(f"  intensity_processor:  {iproc_t:.4f}s")
+    print(f"  subtotal:             {feature_sum:.4f}s")
+ 
+    print("\nlaser-tiled path:")
+    print(f"  tile (repeat+reshape):{tile_t:.4f}s")
+    print(f"  pre_laser_downsample: {prelas_t:.4f}s")
+    print(f"  film_late:            {flate_t:.4f}s")
+    print(f"  coeff_head (+pool):   {coeff_t:.4f}s")
+    print(f"  shared_decoder:       {dec_t:.4f}s")
+    print(f"  subtotal:             {laser_sum:.4f}s")
+ 
+    print(f"\nsum of stages:          {feature_sum + laser_sum:.4f}s")
+    print(f"full forward:           {full_t:.4f}s")
+    print(f"full fwd+bwd (1 step):  {step_t:.4f}s")
+    print(f"backward / forward:     {(step_t - full_t) / full_t:.2f}x")
+    print(f"laser path share:       {laser_sum / (feature_sum + laser_sum) * 100:.0f}%")
