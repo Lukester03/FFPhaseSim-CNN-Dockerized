@@ -18,6 +18,7 @@ import tensorflow as tf
 import soapy
 from keras import layers, Model
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 from scipy.signal import CZT
 from numpy.fft import fft2, ifft2
 
@@ -226,7 +227,7 @@ class BeamPerturbator:
         R_target = np.sqrt(dx ** 2 + dy ** 2 + z_f ** 2)
         sin_theta_x = dx / R_target
         sin_theta_y = dy / R_target
-        piston = -k * (R_target - z_f)
+        piston = -k * (dx ** 2 + dy ** 2) / (R_target + z_f)
         # summing over contributions from each aperture
         for n in range(num_apertures):
             X_local = X - x_n[n]
@@ -653,7 +654,7 @@ class FiLMConditioner(layers.Layer):
 class FFPhaseCNN(Model):
     def __init__(self, mode_count = 16, 
         gabor_kernel_size = 9, gabor_orientations = 8, gabor_lmbda = None, laser_count = 7,
-        element_positions = None, raw_channels = 16, stride = 4, **kwargs):
+        element_positions = None, raw_channels = 16, stride = 4, scale = 4, **kwargs):
         super().__init__(**kwargs)
         self.num_modes = mode_count
         self.gabor_kern_size = gabor_kernel_size
@@ -670,9 +671,16 @@ class FFPhaseCNN(Model):
                                  [ 0.8660254, 0.5, 0.]]
         self.element_positions = np.asarray(element_positions, dtype=np.float32)
 
-        self.zernike_conv = ZernikeConvLayer(kernel_size = 11, num_modes = mode_count, stride = stride, name = "zernike_features")
-        self.gabor_conv = GaborConvLayer(kernel_size = gabor_kernel_size, 
-        num_orientations = gabor_orientations, wavelengths = gabor_lmbda, stride=stride, gamma = 0.5, name = "gabor_features")
+        self.scale = int(scale)
+        odd = lambda k: int(round(k)) + (1- int(round(k)) % 2)
+        zern_kernel = odd(11 * self.scale)
+        gabor_kernel = odd(gabor_kernel_size * self.scale)
+        gabor_waves = [w * self.scale for w in (gabor_lmbda if gabor_lmbda is not None else [5.0, 10.0])]
+        in_stride = stride * self.scale
+
+        self.zernike_conv = ZernikeConvLayer(kernel_size = zern_kernel, num_modes = mode_count, stride = in_stride, name = "zernike_features")
+        self.gabor_conv = GaborConvLayer(kernel_size = gabor_kernel, 
+        num_orientations = gabor_orientations, wavelengths = gabor_waves, stride=in_stride, gamma = 0.5, name = "gabor_features")
 
         # Processor Channel Counts:
         self.Zernike_chan = mode_count
@@ -682,7 +690,7 @@ class FFPhaseCNN(Model):
         #early downsample to improve model speed
         self.i_downsample = tf.keras.Sequential([
             layers.BatchNormalization(),
-            layers.Conv2D(16, 3, strides=2, padding='SAME', activation='leaky_relu', kernel_initializer = 'he_normal'),  # 128×128
+            layers.Conv2D(16, odd(1.5 * (in_stride // 2)), strides = in_stride // 2, padding='SAME', activation='leaky_relu', kernel_initializer = 'he_normal'),  # 128×128
             layers.BatchNormalization(),
             layers.Conv2D(32, 3, strides=2, padding='SAME', activation='leaky_relu', kernel_initializer = 'he_normal'),  # 64×64
         ], name='downsample_i')
@@ -774,6 +782,7 @@ class FFPhaseCNN(Model):
             'gabor_lmbda': self.gabor_lmbda,
             'laser_count': self.num_lasers,
             'element_positions': self.element_positions.tolist(),
+            'scale': self.scale,
         })
         return config
 
@@ -833,9 +842,9 @@ class DatasetStore:
         if 'images' not in self.f:
             self._allocated = initial_size
             self.f.create_dataset('images', shape=(0, *image_shape), maxshape=(None, *image_shape),
-                                   dtype='float32', chunks=(1, *image_shape), compression='gzip')
+                                   dtype='float32', chunks=(1, *image_shape), compression=None)
             self.f.create_dataset('opt_images', shape=(0, *image_shape), maxshape=(None, *image_shape),
-                                   dtype='float32', chunks=(1, *image_shape), compression='gzip')
+                                   dtype='float32', chunks=(1, *image_shape), compression=None)
             self.f.create_dataset('labels', shape=(0, num_channels), maxshape=(None, num_channels),
                                    dtype='float32')
         self._allocated = self.f['images'].shape[0]
@@ -870,63 +879,63 @@ class DatasetStore:
             self.flush()
     
     @staticmethod
-    def make_dataset(h5_path, batch_size=8, shuffle=True, val_split=0.1, intensity_clip_percentile=99.999):
+    def make_dataset(h5_path, batch_size=8, shuffle=True, val_split=0.1,
+                     intensity_clip_percentile=99.999, crop=512, pool=1):
         h5_path = Path(h5_path)
+ 
+        def reduce(imgs):
+            """[n, G, G] -> [n, crop/pool, crop/pool], centre crop then block mean."""
+            imgs = np.asarray(imgs, dtype=np.float32)
+            G = imgs.shape[1]
+            if crop is not None and crop < G:
+                c0 = (G - crop) // 2
+                imgs = imgs[:, c0:c0 + crop, c0:c0 + crop]
+            if pool > 1:
+                n, h, w = imgs.shape
+                imgs = imgs[:, :h // pool * pool, :w // pool * pool]
+                imgs = imgs.reshape(n, h // pool, pool, w // pool, pool).mean(axis=(2, 4))
+            return imgs
+ 
         with h5py.File(h5_path, 'r') as f:
             n_total = f['images'].shape[0]
-            grid_size = f['images'].shape[1]
             num_channels = f['labels'].shape[1]
             if h5_path.with_suffix('.catalog.csv').exists():
-                catalog = pd.read_csv(h5_path.with_suffix('.catalog.csv'))
-                n_total = len(catalog)
-
+                n_total = len(pd.read_csv(h5_path.with_suffix('.catalog.csv')))
+ 
             indices = np.arange(n_total)
             if shuffle:
-                rng = np.random.default_rng(42)
-                rng.shuffle(indices)
+                np.random.default_rng(42).shuffle(indices)
             n_val = int(n_total * val_split)
             val_idx, train_idx = indices[:n_val], indices[n_val:]
+ 
             n_samples = min(100, len(train_idx))
             sample_idx = np.sort(np.random.default_rng(42).choice(train_idx, n_samples, replace=False))
-            sample_images = f['images'][sample_idx]
-            norm_scale = np.percentile(f['images'][sample_idx], intensity_clip_percentile)
-
-        del sample_images
-
-        def gen(idx_array):
-            for i in idx_array:
-                image = f['images'][i].astype(np.float32)
-                label = f['labels'][i].astype(np.float32)
-                yield image, label
-
-        output_signature = (
-            tf.TensorSpec(shape=(grid_size, grid_size), dtype=tf.float32),
-            tf.TensorSpec(shape=(num_channels,), dtype=tf.float32),
-        )
-
+            sample = reduce(f['images'][sample_idx])          # norm from the images the net actually sees
+            norm_scale = float(np.percentile(sample, intensity_clip_percentile))
+            grid_size = sample.shape[1]
+        del sample
+ 
         def preprocess(image, label):
             image = tf.clip_by_value(image, 0.0, norm_scale) / norm_scale
             image = tf.math.log1p(image * 1000.0)
-            image = image[..., None]
-            return image, label
-
+            return image[..., None], label
+ 
         def build(idx_array, training):
             idx_sorted = np.sort(idx_array)
             with h5py.File(h5_path, 'r') as f:
-                all_images = f['images'][idx_sorted].astype(np.float32)
+                # read in chunks so the full 1024^2 images never sit in RAM all at once
+                all_images = np.concatenate([reduce(f['images'][idx_sorted[s:s + 64]])
+                                             for s in range(0, len(idx_sorted), 64)])
                 all_labels = f['labels'][idx_sorted].astype(np.float32)
             ds = tf.data.Dataset.from_tensor_slices((all_images, all_labels))
             ds = ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
             if training:
                 ds = ds.shuffle(len(idx_sorted), seed=42, reshuffle_each_iteration=True)
-            # keep every validation example
-            ds = ds.batch(batch_size, drop_remainder=training)
-            ds = ds.prefetch(tf.data.AUTOTUNE)
-            return ds
-
-        train_ds = build(train_idx, training=True)
-        val_ds = build(val_idx, training=False)
-        return train_ds, val_ds, grid_size, norm_scale
+                ds = ds.map(symmetry_augment, num_parallel_calls=tf.data.AUTOTUNE)
+            ds = ds.batch(batch_size, drop_remainder=training)   # keep every validation example
+            return ds.prefetch(tf.data.AUTOTUNE)
+ 
+        return build(train_idx, True), build(val_idx, False), grid_size, norm_scale
 
     def flush(self):
         self.f.flush()
@@ -937,11 +946,9 @@ class DatasetStore:
 
     def close(self):
         self.flush()
+        for ds_name in ["images", "opt_images", 'labels']:
+            self.f[ds_name].resize(self._n, axis=0)
         self.f.close()
-# model decorator
-@tf.function
-def forward_pass(model, inputs):
-    return model(inputs, training=False)
 
 def optimal_phases_from_M(M, n_iter, center_idx, tol=1e-6):
     """Exactly the optimizer in BeamPerturbator.compute_optimal_phases,
@@ -1134,25 +1141,104 @@ class GPUDataGenerator:
             results[b]['best_intensity'] = float(np.mean(opt_imgs[b][self.mask]))
         return results, screens
 
+REF_FRINGE_PX = 35
+
+def fringe_geometry(array, apert_radi=0.05, clip_ratio=0.6, grid_N=1024, verbose=True):
+    """Analytic sizes, in output pixels, of the structures in the far-field image.
+ 
+    BeamPerturbator.fresnel_czt samples the far field with a window of
+    20*lambda*z/d_array across grid_N pixels, d_array = (x-extent of the element
+    centres) + 2*apert_radi. A far-field length lambda*z*X (X in 1/m) therefore
+    spans X * d_array * grid_N / 20 pixels, independent of wavelength and
+    distance (up to z/(z - 20 km) = 1.00005).
+ 
+      fringe from a baseline b          : X = 1/b
+      single-element Gaussian envelope  : 1/e^2 intensity radius, X = 1/(pi*w0),
+                                          w0 = clip_ratio*apert_radi
+                                          (the aperture truncation makes the real
+                                          envelope ~7% wider)
+      hard-aperture Airy first zero     : X = 1.22/(2*apert_radi)
+    """
+    pitch = 2 * apert_radi                                    # BeamPerturbator.element_space
+    pos = np.asarray(array.arrayvector)[:, :2] * pitch
+    d_array = (pos[:, 0].max() - pos[:, 0].min()) + 2 * apert_radi
+    px = lambda X: X * d_array * grid_N / 20.0
+    b = np.linalg.norm(pos[:, None] - pos[None], axis=-1)
+    b = b[b > 1e-9]
+    g = {'fringe_nearest_px': px(1 / b.min()),                # coarsest fringes (neighbouring elements)
+         'fringe_finest_px': px(1 / b.max()),                 # finest fringes (longest baseline)
+         'envelope_radius_px': px(1 / (np.pi * clip_ratio * apert_radi)),
+         'airy_zero_px': px(1.22 / (2 * apert_radi))}
+    if verbose:
+        print("far-field geometry (output px): " + ", ".join(f"{k} {v:.1f}" for k, v in g.items()))
+    return g
+
+def center_crop(imgs, crop):
+    """[n, G, G] -> central [n, crop, crop]; crop=None or >= G returns imgs unchanged.
+    Must match make_dataset's crop (c0 = (G - crop) // 2)."""
+    if crop is None or crop >= imgs.shape[-1]:
+        return imgs
+    c0 = (imgs.shape[-1] - crop) // 2
+    return imgs[..., c0:c0 + crop, c0:c0 + crop]
+ 
+ 
+def load_trained_model(run_label, grid_N, array):
+    """Rebuild the model exactly as the training branch does and load best weights.
+    grid_N is the size of the STORED images; the model is built for the size it was
+    trained on (the crop, if make_dataset cropped).
+    Returns (model, norm_scale, outer_positions, center_idx, crop)."""
+    import json
+    cfg_path = f'outputs/train_logs/{run_label}_config.json'
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    norm_scale = float(cfg['norm_scale'])
+    # make_dataset's default is crop=512, pool=1; record 'crop' in the config to override
+    crop = cfg.get('crop', 512)
+    crop = None if (crop is None or crop >= grid_N) else int(crop)
+    in_N = grid_N if crop is None else crop
+    center_idx = array.find_center_index()
+    outer_positions = np.delete(array.arrayvector, center_idx, axis=0)
+    geom = fringe_geometry(array, grid_N=grid_N, verbose=False)
+    scale = max(1, int(round(geom['fringe_nearest_px'] / REF_FRINGE_PX)))
+    model = FFPhaseCNN(laser_count=len(outer_positions), element_positions=outer_positions, scale=scale)
+    model.build(input_shape=(1, in_N, in_N, 1))
+    model.load_weights(f'outputs/ckpts/{run_label}/best.weights.h5')
+    print(f"loaded {run_label}: scale {scale}, stored images {grid_N}x{grid_N}, "
+          f"network input {in_N}x{in_N} ({'centre crop' if crop else 'full image'}), "
+          f"norm_scale {norm_scale:.3e}")
+    return model, norm_scale, outer_positions, center_idx, crop
+ 
+ 
+def preprocess_images(imgs, norm_scale):
+    """Same transform as make_dataset's preprocess: [n, N, N] -> [n, N, N, 1] float32."""
+    imgs = np.asarray(imgs, dtype=np.float32)
+    return (np.log1p(np.clip(imgs, 0.0, norm_scale) / norm_scale * 1000.0))[..., None]
+ 
+ 
+def predict_outer_phases(model, imgs, norm_scale, crop=None, batch=8):
+    """[n, N, N] raw intensity -> [n, L] predicted outer phases (rad).
+    crop must be the crop the model was trained with (from load_trained_model)."""
+    out = []
+    for s in range(0, len(imgs), batch):
+        x = tf.constant(preprocess_images(center_crop(imgs[s:s + batch], crop), norm_scale))
+        out.append(predicted_angles(model(x, training=False)).numpy())
+    return np.concatenate(out)
+ 
+ 
+def twin_aware_compare(pred, labels, perm):
+    """Same branch rule as twin_invariant_loss. Returns per-sample dict of arrays."""
+    wrap = lambda v: np.angle(np.exp(1j * v))
+    tw = -labels[:, perm]
+    l_orig = (1 - np.cos(labels - pred)).mean(1)
+    l_twin = (1 - np.cos(tw - pred)).mean(1)
+    use_twin = l_twin < l_orig
+    eff = np.where(use_twin[:, None], tw, labels)
+    err = wrap(eff - pred)                                   # signed, rad, [n, L]
+    return {'err_deg': np.degrees(np.abs(err)), 'signed_err': err, 'use_twin': use_twin,
+            'loss': np.minimum(l_orig, l_twin), 'branch_gap': np.abs(l_orig - l_twin),
+            'eff': eff}
+
 #learning rate schedule - Warmup
-class lr_warmup(tf.keras.optimizers.schedules.LearningRateSchedule):
-    def __init__(self, initial_learning_rate, flat_learning_rate, warmup_steps = 20, hold_steps = 80, decay_steps = 60):
-        self.initial_learning_rate = initial_learning_rate
-        self.flat_learning_rate = flat_learning_rate
-        self.lr_diff = self.flat_learning_rate - self.initial_learning_rate
-        self.warmup_steps = warmup_steps
-
-    def __call__(self, step):
-        step = tf.cast(step, tf.float32)
-        pct = tf.minimum(step / self.warmup_steps, 1.0)
-        return self.initial_learning_rate + pct * (self.lr_diff)
-
-    def get_config(self):
-            return {
-            "initial_learning_rate": float(self.initial_learning_rate.numpy()),
-            "flat_learning_rate": float(self.flat_learning_rate.numpy()),
-            "warmup_steps": float(self.warmup_steps.numpy()),
-            }
 
 class WarmupCosine(tf.keras.optimizers.schedules.LearningRateSchedule):
     """Linear warmup from init_lr to peak_lr, then cosine decay to
@@ -1239,55 +1325,6 @@ def predicted_angles(y_pred):
     """[B, L, 2] unit vectors -> [B, L] angles in radians."""
     return tf.atan2(y_pred[..., 1], y_pred[..., 0])
 
-def sdp_bound(M):
-    import cvxpy as cp
-    n = M.shape[0]
-    scale = 1.0 / np.max(np.abs(M))
-    M_scaled = M * scale
-
-    X = cp.Variable((n, n), hermitian=True)
-    constraints = [X >> 0] + [X[i, i] == 1 for i in range(n)]
-    prob = cp.Problem(cp.Maximize(cp.real(cp.trace(M_scaled @ X))), constraints)
-    prob.solve(solver=cp.SCS, eps=1e-8)
-
-    if prob.status not in ("optimal", "optimal_inaccurate"):
-        print(f"WARNING: solver status = {prob.status}")
-
-    return prob.value / scale
-
-def multi_restart_check(M, n_restarts=20, n_iter=100, tol=1e-6):
-    n = M.shape[0]
-    best_power = -np.inf
-    powers = []
-    for _ in range(n_restarts):
-        c = np.exp(1j * np.random.uniform(0, 2 * np.pi, n))
-        prev = -np.inf
-        for _ in range(n_iter):
-            c = np.exp(1j * np.angle(M @ c))
-            power = np.real(c.conj() @ M @ c)
-            if power - prev < tol * abs(power):
-                break
-            prev = power
-        powers.append(power)
-        best_power = max(best_power, power)
-    return best_power, powers
-
-def run_optimality_diagnostics(M, power_method_result):
-    n = M.shape[0]
-    eigvals = np.linalg.eigvalsh(M)
-    ub_loose = n * eigvals[-1]
-    top_eig_fraction = eigvals[-1] / np.trace(M).real
-    best_restart, all_restarts = multi_restart_check(M)
-    ub_tight = sdp_bound(M)
-
-    print(f"power-method result:          {power_method_result:.6e}")
-    print(f"best of {len(all_restarts)} restarts:          {best_restart:.6e}")
-    print(f"loose bound (n*lambda_max):   {ub_loose:.6e}")
-    print(f"tight bound (SDP):            {ub_tight:.6e}")
-    print(f"top_eig_fraction:             {top_eig_fraction:.4f}")
-    print(f"loose gap:                    {(ub_loose - power_method_result) / ub_loose:.4f}")
-    print(f"tight gap:                    {(ub_tight - power_method_result) / ub_tight:.4f}")
-
 def twin_permutation(positions):
     """perm[i] = index of the element at -position[i]. Works on the full array
     (arrayvector) or on outer_positions. Raises if the array isn't centrosymmetric."""
@@ -1297,7 +1334,21 @@ def twin_permutation(positions):
     if d[np.arange(len(p)), perm].max() > 1e-6:
         raise ValueError("array is not centrosymmetric; no exact twin")
     return perm
+
+AUG_PERMS = tf.constant([[0, 1, 2, 3, 4, 5],    # identity
+                         [4, 5, 2, 3, 0, 1],    # mirror x  (flip columns)
+                         [1, 0, 3, 2, 5, 4],    # mirror y  (flip rows)
+                         [5, 4, 3, 2, 1, 0]],   # rotate 180 (= both mirrors)
+                        tf.int32)               # new_label = tf.gather(old_label, perm)
  
+def symmetry_augment(image, label):
+    """image [H, W, 1] (after preprocess), label [6] radians, outer-element order."""
+    k = tf.random.uniform([], 0, 4, dtype=tf.int32)
+    fx = tf.logical_or(tf.equal(k, 1), tf.equal(k, 3))
+    fy = tf.logical_or(tf.equal(k, 2), tf.equal(k, 3))
+    image = tf.cond(fx, lambda: tf.roll(tf.reverse(image, [1]), 1, axis=1), lambda: image)
+    image = tf.cond(fy, lambda: tf.roll(tf.reverse(image, [0]), 1, axis=0), lambda: image)
+    return image, tf.gather(label, AUG_PERMS[k])
  
 def twin_invariant_loss(y_true, y_pred, perm, reduce=True):
     """1 - cos loss scored against whichever of {phi, twin(phi)} the prediction is
@@ -1329,21 +1380,14 @@ def twin_floor_deg(labels, perm):
 if __name__ == "__main__":
     print(f"Time to import: {Timer.elapsed()}")
     choice = input("""What test are you running?
-    -h5
-    -train data 
-    -train data gpu
-    -training 
-    -optsim 
-    -cnn 
-    -opt_diagnostics 
-    -bottleneck
-    -gpu_validate
-    -twin_check\n""")
+    -h5     -train data gpu     -training       -optsim 
+    -opt_diagnostics -bottleneck        -gpu_validate   -twin_check
+    -val_outliers           -nn_bucket_eval     -ckpt_check\n""")
 
 #looking at testing data
 if choice == "h5":
     example_num = int(input("What example do you want to view? \n"))
-    filename = "testtrainingdata.h5"
+    filename = "data/testtrainingdata.h5"
     h5_path = Path(filename)
     catalog_path = h5_path.with_suffix('.catalog.csv')
     with h5py.File(h5_path, 'r') as f:
@@ -1370,13 +1414,13 @@ if choice == "h5":
     print(f"iterations:     {row['iterations']}")
     print(f"target:         ({row['target_x']}, {row['target_y']})")
     plt.tight_layout()
-    plt.savefig(f'outputs/example_{example_num}.png', dpi=150, bbox_inches='tight')
+    plt.savefig(f'outputs/example_{example_num}_unlog.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 #training CNN
 if choice == "training":
     # ---- run identity: CHANGE FOR EVERY NEW RUN ---------------------------
-    RUN_LABEL = 'training_twin_v1'
+    RUN_LABEL = 'training_twin_v4'
     LOG_PATH  = f'outputs/train_logs/{RUN_LABEL}.csv'
     CKPT_DIR  = f'outputs/ckpts/{RUN_LABEL}'
  
@@ -1423,6 +1467,9 @@ if choice == "training":
  
     # ---- model + optimizers -----------------------------------------------
     model = FFPhaseCNN(laser_count=L, element_positions=outer_positions)
+    print("SCALE = 4", "| zernike stride", model.zernike_conv.stride,
+      "| gabor stride", model.gabor_conv.stride,
+      "| i_downsample first-conv stride", model.i_downsample.layers[1].strides)
     model.build(input_shape=(1, grid_size, grid_size, 1))
     norm_vars, other_vars, all_vars, all_names, n_norm = build_variable_groups(model)
  
@@ -1568,76 +1615,11 @@ if choice == "training":
           f"(zero-correction baseline {zero_baseline_deg:.2f}°) "
           f"-> {CKPT_DIR}/best.weights.h5")
 
-#testing data generation
-if choice == "train data":
-    grid_data_size = int(input("How long should the grid be?\n"))
-    grid_ssl = int(input("How large should sampling be?(0.1mm)\n"))
-    real_count = int(input("How many realizations do you want to generate?\n"))
-    fried_m = 16
-    array = ArrayDesign(2, 'hex')
-    writer = DatasetStore('testtrainingdata.h5', image_shape = (grid_data_size,grid_data_size), 
-                          num_channels = array.arrayvector.shape[0]-1, flush_count=16)
-    dist = 384000000
-    target = [0, 0, dist]
-    sim = BeamPerturbator(ssl = grid_ssl*1e-4, targ_pos = target, array_des = array, 
-                          fried_mult = fried_m, Ideal=False, grid_length = grid_data_size)
-    x, y = sim.input_e_field_base()
-
-    for real in range(real_count):
-        if real != 0:
-            sim.generate_turbulence()
-        #linearity_test(sim)
-        sim.set_rel_phases()
-        input = sim.input_e_quick()
-        init_e_image, x_def, y_def = sim.fresnel_propagation(input, dist)
-        init_image = np.abs(init_e_image) ** 2
-
-        best_params, bucket_power, n_iters, mask = sim.compute_optimal_phases(100)
-
-        sim.set_rel_phases(best_params)
-        opt_input = sim.input_e_quick()
-        opt_e_image, _, _ = sim.fresnel_propagation(opt_input, dist)
-        recomputed_power = np.sum(np.abs(opt_e_image[mask]) ** 2)
-        #print("power from M:", bucket_power, " power from direct repropagation:", recomputed_power)
-        opt_image = np.abs(opt_e_image)**2
-
-        best_intensity = np.average(opt_image[mask])
-        init_intensity = np.average(init_image[mask])
-
-        outer_params = np.delete(best_params, sim.center_idx)
-
-        writer.add_example(init_image.astype('float32'), opt_image.astype('float32'), 
-                           outer_params.astype('float32'), fried_mult = fried_m, 
-                           init_intensity = init_intensity, best_intensity = best_intensity, 
-                           iterations = n_iters, target_x = target[0], 
-                           target_y = target[1])
-        print(f"Realization #{real+1} generated. Time elapsed: {Timer.elapsed():.2f}")
-    writer.close()
-
-# diagnostics:
-if choice == "opt_diagnostics":
-    grid_data_size = int(input("Grid size?\n"))
-    grid_ssl = int(input("Sampling (0.1mm)?\n"))
-    n_samples = int(input("How many realizations to check?\n"))
-    dist = 384000000
-    target = [0, 0, dist]
-    array = ArrayDesign(2, 'hex')
-    sim = BeamPerturbator(ssl=grid_ssl * 1e-4, targ_pos=target, array_des=array,
-                          fried_mult=16, Ideal=False, grid_length=grid_data_size)
-    x, y = sim.input_e_field_base()
-
-    for i in range(n_samples):
-        if i != 0:
-            sim.generate_turbulence()
-        optimal_phases, power, n_iters, mask, M = sim.compute_optimal_phases(40, return_m=True)
-        print(f"\n--- Sample {i} ---")
-        run_optimality_diagnostics(M, power)
-
 # optical simulator test 
 if choice == "optsim":
     dist = np.float64(384000000)
     target = [0, 0, dist]
-    john_array = ArrayDesign(2, 'hex')
+    john_array = ArrayDesign(2, 'square')
     john_perturbation = BeamPerturbator(ssl = 16e-4, targ_pos = target, array_des = john_array, 
                                         Ideal = True, fried_mult = 64.0, grid_length = 256)
     x_in, y_in = john_perturbation.input_e_field_base()
@@ -1655,14 +1637,14 @@ if choice == "optsim":
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
  
     im1 = ax1.imshow(I_field, cmap='plasma', origin='lower',
-                      extent=[x_in.min(), x_in.max(), y_in.min(), y_in.max()])
+                      extent=[x_in.min(), x_in.max(), y_in.min(), y_in.max()], norm=LogNorm(vmin=I_field.max()*1e-4, vmax=I_field.max()))
     ax1.set_title('Intensity at Apertures')
     ax1.set_xlabel('x [m]')
     ax1.set_ylabel('y [m]')
     plt.colorbar(im1, ax=ax1)
  
     im2 = ax2.imshow(I_field_ff, cmap='plasma', origin='lower',
-                      extent=[x_out.min(), x_out.max(), y_out.min(), y_out.max()])
+                      extent=[x_out.min(), x_out.max(), y_out.min(), y_out.max()], norm=LogNorm(vmin=I_field_ff.max()*1e-4, vmax=I_field_ff.max()))
     ax2.plot(target[0], target[1], '+', color='cyan', markersize=12, mew=2)
     ax2.set_title('Intensity at Far Field')
     ax2.set_xlabel('x [m]')
@@ -1675,274 +1657,6 @@ if choice == "optsim":
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     plt.savefig(f'{out_dir}/intensity_plots_{timestamp}.png', dpi=300, bbox_inches='tight')
     plt.close(fig)
-
-#CNN test
-if choice == "cnn":
-    cnn = FFPhaseCNN()
-    dummy_input = tf.random.normal((1, 1024, 1024, 1))
-    pred = cnn(dummy_input)                                   # now (1, 7, 2)
-    ang = predicted_angles(pred).numpy()
-    print(f"Initial predictions (vectors): {pred.numpy()}")
-    print(f"Initial predictions (angles):  {ang}")
-    print(f"Mean: {np.mean(ang):.4f}")
-    print(f"Std: {np.std(ang):.4f}")
-    cnn.summary()
-
-if choice == 'label_div':
-    with h5py.File('testtrainingdata.h5', 'r') as f:
-        all_labels = f['labels'][:512]
-    print("per-channel std:", np.std(all_labels, axis=0))
-    print("per-channel range:", np.ptp(all_labels, axis=0))
-    print("per-channel mean:", np.mean(all_labels, axis=0))
-
-if choice == "long_overfit":
-    # ---- run identity: CHANGE THESE FOR EVERY NEW RUN ---------------------
-    RUN_LABEL = 'long_overfit_cosvec_v1'
-    LOG_PATH  = f'outputs/overfit_logs/{RUN_LABEL}.csv'
-    CKPT_DIR  = f'outputs/ckpts/{RUN_LABEL}'
- 
-    # ---- config: single source of truth for both the optimizers and the JSON
-    MAIN_LR          = 2.0e-3
-    NORM_LR          = 3.0e-5
-    WARMUP_STEPS     = 20
-    TOTAL_STEPS      = 6000     # ~38 h at ~22.7 s/step
-    RATIO_EVERY      = 50
-    CHECKPOINT_EVERY = 250
-    PRINT_EVERY      = 50
- 
-    array = ArrayDesign(2, 'hex')
-    center_idx = array.find_center_index()
-    outer_positions = np.delete(array.arrayvector, center_idx, axis=0)
- 
-    data = np.load('data/fixed_overfit_batch.npz')
-    images = tf.constant(data['images'])
-    labels = tf.constant(data['labels'])
-    grid_size = int(images.shape[1])
-    print(f"loaded fixed batch: images={images.shape}, labels={labels.shape}")
- 
-    model = FFPhaseCNN(
-        laser_count=outer_positions.shape[0],
-        element_positions=outer_positions,
-    )
-    model.build(input_shape=(1, grid_size, grid_size, 1))
-    norm_vars, other_vars, all_vars, all_names, n_norm = build_variable_groups(model)
- 
-    main_lr = lr_warmup(1e-7, MAIN_LR, warmup_steps=WARMUP_STEPS)
-    norm_lr = lr_warmup(1e-7, NORM_LR, warmup_steps=WARMUP_STEPS)
-    optimizer_main = tf.keras.optimizers.Adam(
-        learning_rate=main_lr, clipnorm=0.5, beta_1=0.9, beta_2=0.99, epsilon=1e-8
-    )
-    optimizer_norm = tf.keras.optimizers.Adam(
-        learning_rate=norm_lr, clipnorm=0.2, beta_1=0.9, beta_2=0.995, epsilon=1e-8
-    )
- 
-    @tf.function
-    def train_step(images, labels):
-        with tf.GradientTape() as tape:
-            pred = model(images, training=True)
-            loss = circular_phase_loss(labels, pred)
-        grads = tape.gradient(loss, all_vars)
-        optimizer_main.apply_gradients(zip(grads[n_norm:], other_vars))
-        optimizer_norm.apply_gradients(zip(grads[:n_norm], norm_vars))
-        ang = predicted_angles(pred)
-        err_deg = tf.abs(tf.atan2(tf.sin(labels - ang), tf.cos(labels - ang))) * (180.0 / np.pi)
-        grad_max = tf.reduce_max(tf.stack([tf.norm(g) for g in grads]))
-        return loss, grad_max, tf.reduce_mean(err_deg), tf.reduce_max(err_deg)
- 
-    # ---- logging ----------------------------------------------------------
-    Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
-    Path(CKPT_DIR).mkdir(parents=True, exist_ok=True)
- 
-
-    with open(LOG_PATH.replace('.csv', '_config.json'), 'w') as f:
-        json.dump({
-            'run_label': RUN_LABEL, 'main_lr': MAIN_LR, 'norm_lr': NORM_LR,
-            'warmup_steps': WARMUP_STEPS, 'loss': '1 - cos(d)',
-            'output': 'unit vector(cos, sin)', 'decoder_stride': 1, 'film_early': False,
-            'pre_laser_downsample': 'before tile', 'total_steps': TOTAL_STEPS,
-        }, f, indent=2)
- 
-    csv_file = open(LOG_PATH, mode='w', newline='')
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow([
-        'step', 'elapsed_s', 'loss', 'best_loss', 'mae_deg', 'max_err_deg',
-        'grad_norm_max', 'conv_update_ratio', 'norm_update_ratio',
-    ])
- 
-    best_loss = float('inf')
-    t_start = Timer.elapsed()
-    print(f"{RUN_LABEL} begin — {TOTAL_STEPS} steps")
- 
-    for step in range(TOTAL_STEPS):
-        measure = (step % RATIO_EVERY == 0)
-        if measure:
-            before = [tf.identity(v) for v in all_vars]
- 
-        loss, grad_max, mae, max_err = train_step(images, labels)
-        loss_val, mae_val, max_err_val = float(loss), float(mae), float(max_err)
- 
-        conv_r, norm_r = (update_ratio_medians(all_vars, before, n_norm)
-                          if measure else (float('nan'), float('nan')))
- 
-        if loss_val < best_loss:
-            best_loss = loss_val
-            model.save_weights(f'{CKPT_DIR}/best.weights.h5')
-        if step % CHECKPOINT_EVERY == 0:
-            model.save_weights(f'{CKPT_DIR}/step_{step:05d}.weights.h5')
- 
-        elapsed = Timer.elapsed() - t_start
-        csv_writer.writerow([step, round(elapsed, 1), loss_val, best_loss,
-                             mae_val, max_err_val, float(grad_max), conv_r, norm_r])
-        csv_file.flush()
- 
-        if step % PRINT_EVERY == 0:
-            print(f"step {step}: loss={loss_val:.4f}  best={best_loss:.4f}  "
-                  f"mae={mae_val:.2f}°  max_err={max_err_val:.1f}°  "
-                  f"upd_conv={conv_r:.1e}  upd_norm={norm_r:.1e}  "
-                  f"t={elapsed/3600:.2f}h", flush=True)
- 
-    csv_file.close()
-    print(f"done. best loss: {best_loss:.4f}  ->  {CKPT_DIR}/best.weights.h5")
-
-if choice == "bottleneck":
-    batch = int(input("Batch size to profile? (1 for per-sample, 32 for training-realistic)\n"))
- 
-    array = ArrayDesign(2, 'hex')
-    center_idx = array.find_center_index()
-    outer_positions = np.delete(array.arrayvector, center_idx, axis=0)
- 
-    model = FFPhaseCNN(
-        laser_count=outer_positions.shape[0],
-        element_positions=outer_positions,
-    )
-    model.build(input_shape=(1, 1024, 1024, 1))
-    norm_vars, other_vars, all_vars, all_names, n_norm = build_variable_groups(model)
- 
-    inputs = tf.random.normal((batch, 1024, 1024, 1))
-    L = model.num_lasers
- 
-    # ---- every stage traced --------
-    @tf.function
-    def f_downsample(x):      return model.i_downsample(x, training=False)
-    @tf.function
-    def f_zernike_conv(x):    return model.zernike_conv(x)
-    @tf.function
-    def f_gabor_conv(x):      return model.gabor_conv(x)
-    @tf.function
-    def f_zernike_proc(x):    return model.zernike_processor(x, training=False)
-    @tf.function
-    def f_gabor_proc(x):      return model.gabor_processor(x, training=False)
-    @tf.function
-    def f_intensity_proc(x):  return model.intensity_processor(x, training=False)
- 
-    @tf.function
-    def f_tile(combined):
-        B = tf.shape(combined)[0]
-        pos_all = tf.constant(model.element_positions[:, :2], dtype=tf.float32)
-        pos_encoded = model.sinusoidal_position_encoding(pos_all)
-        pos_flat = tf.reshape(tf.tile(pos_encoded[None, ...], [B, 1, 1]), [B * L, -1])
-        Hc, Wc, Cc = combined.shape[1], combined.shape[2], combined.shape[3]
-        tiled = tf.repeat(combined[:, None, ...], L, axis=1)
-        tiled = tf.reshape(tiled, [B * L, Hc, Wc, Cc])
-        return tiled, pos_flat
- 
-    @tf.function
-    def f_pre_laser(x):                 return model.pre_laser_downsample(x, training=False)
-    @tf.function
-    def f_film_late(x, pos_flat):       return model.film(x, pos_flat)
-    @tf.function
-    def f_coeff_head(x):                return model.coeff_head(model.global_pool(x), training=False)
-    @tf.function
-    def f_decoder(x):                   return model.shared_decoder(x, training=False)
- 
-    @tf.function
-    def f_forward(x):
-        return model(x, training=False)
-    
-    @tf.function
-    def f_forward_train(x):
-        return model(x, training=True)
-
-    @tf.function
-    def f_train_step(x, labels):
-        with tf.GradientTape() as tape:
-            pred = model(x, training=True)
-            loss = circular_phase_loss(labels, pred)
-        return tape.gradient(loss, all_vars)
- 
-    def timeit(fn, n=100):
-        for _ in range(5):
-            out = fn()
-        _ = out[0].numpy() if isinstance(out, (tuple, list)) else out.numpy()
-        t0 = Timer.elapsed()
-        for _ in range(n):
-            out = fn()
-        _ = out[0].numpy() if isinstance(out, (tuple, list)) else out.numpy()
-        return (Timer.elapsed() - t0) / n, out
- 
-    # ---- feature-extraction stages ---------------------------------------
-    down_t,   down_inputs = timeit(lambda: f_downsample(inputs))
-    zern_t,   zernike_raw = timeit(lambda: f_zernike_conv(inputs))
-    gabor_t,  gabor_raw   = timeit(lambda: f_gabor_conv(inputs))
-    zproc_t,  z_features  = timeit(lambda: f_zernike_proc(zernike_raw))
-    gproc_t,  g_features  = timeit(lambda: f_gabor_proc(gabor_raw))
-    iproc_t,  i_features  = timeit(lambda: f_intensity_proc(down_inputs))
- 
-    combined = tf.concat([z_features, g_features, i_features], axis=-1)
- 
-    # ---- laser-tiled stages ----------------------------------------------
-    prelas_t, downsampled = timeit(lambda: f_pre_laser(combined))
-    tile_t,   tiled_pair  = timeit(lambda: f_tile(downsampled))
-    tiled, pos_flat = tiled_pair
-    flate_t,  conditioned = timeit(lambda: f_film_late(tiled, pos_flat))
-    coeff_t,  _           = timeit(lambda: f_coeff_head(conditioned))
-    dec_t,    _           = timeit(lambda: f_decoder(conditioned))
- 
-    # ---- whole-model forward and backward --------------------------------
-    labels = tf.zeros((batch, L), dtype=tf.float32)
-    fwd_tr_t, _ = timeit(lambda:f_forward_train(inputs), n = 20)
-    full_t, _ = timeit(lambda: f_forward(inputs), n = 20)
-    tf.config.experimental.reset_memory_stats('GPU:0')
-    step_t, _ = timeit(lambda: f_train_step(inputs, labels), n = 20)
-    mem = tf.config.experimental.get_memory_info('GPU:0')
-    print(f"peak VRAM during train step: {mem['peak'] / 1e9:.2f} GB")
-
-    feature_sum = down_t + zern_t + gabor_t + zproc_t + gproc_t + iproc_t
-    laser_sum = tile_t + prelas_t + flate_t + coeff_t + dec_t
- 
-    print(f"\n--- batch size {batch}, all stages graph-traced ---")
-    print(f"tiled tensor shape after repeat: {tiled.shape}  "
-          f"({np.prod(tiled.shape) * 4 / 1e9:.2f} GB in float32)\n")
- 
-    print("feature extraction:")
-    print(f"  i_downsample:         {down_t:.4f}s")
-    print(f"  zernike_conv:         {zern_t:.4f}s")
-    print(f"  gabor_conv:           {gabor_t:.4f}s")
-    print(f"  zernike_processor:    {zproc_t:.4f}s")
-    print(f"  gabor_processor:      {gproc_t:.4f}s")
-    print(f"  intensity_processor:  {iproc_t:.4f}s")
-    print(f"  subtotal:             {feature_sum:.4f}s")
- 
-    print("\nlaser-tiled path:")
-    print(f"  tile (repeat+reshape):{tile_t:.4f}s")
-    print(f"  pre_laser_downsample: {prelas_t:.4f}s")
-    print(f"  film_late:            {flate_t:.4f}s")
-    print(f"  coeff_head (+pool):   {coeff_t:.4f}s")
-    print(f"  shared_decoder:       {dec_t:.4f}s")
-    print(f"  subtotal:             {laser_sum:.4f}s")
- 
-    print(f"\nsum of stages:          {feature_sum + laser_sum:.4f}s"
-          f"   (< full foward: separate graps pay per-call launch overhead"
-          f"and lose cross-stage fusion; treat stages times as relative only")
-    print(f"full forward:           {full_t:.4f}s")
-    print(f"forward (training = true): {fwd_tr_t:.4f}s")
-    print(f"full fwd+bwd (1 step):  {step_t:.4f}s")
-    print(f"backward only:             {step_t - fwd_tr_t:.4f}s")
-    print(f"backward / forward:        {(step_t - fwd_tr_t) / fwd_tr_t}x")
-
-    print(f"\nthroughput:           {batch / step_t:.0f} examples / sec, "
-          f"{1/step_t:.2f} steps / sec")
-    print(f'1000 steps:             {1000 * step_t / 60:.1f} min')
 
 if choice == "twin_check":
     dist = np.float64(384000000)
@@ -2163,7 +1877,7 @@ if choice == "train data gpu":
     real_count = int(input("How many realizations do you want to generate?\n"))
     batch = int(input("Realizations per GPU batch? (4 is a safe start)\n"))
     seed = int(input("Random seed? (use a new one for each extra chunk of data)\n"))
-    fried_m = 1
+    fried_m = 0.424
     out_path = 'data/testtrainingdata.h5'
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     array = ArrayDesign(2, 'hex')
@@ -2396,3 +2110,282 @@ if choice == "screen_exact_check":
           "(relative difference per screen):")
     print(np.array(errs))
     print("Expect ~1e-6 everywhere (float32 rounding).")
+
+if choice == "val_outliers":
+    run_label = input("Run label to analyse (e.g. training_twin_v4)?\n").strip()
+    K = int(input("How many worst examples to plot? (20 recommended)\n") or 20)
+    H5 = Path('data/testtrainingdata.h5')
+    VAL_SPLIT = 0.1                                           # make_dataset default
+    wrap = lambda v: np.angle(np.exp(1j * v))
+ 
+    array = ArrayDesign(2, 'hex')
+    cat = pd.read_csv(H5.with_suffix('.catalog.csv'))
+    with h5py.File(H5, 'r') as f:
+        grid_N = f['images'].shape[1]
+    model, norm_scale, outer_positions, center_idx, crop = load_trained_model(run_label, grid_N, array)
+    perm = twin_permutation(outer_positions)
+ 
+    # identical split to make_dataset
+    n_total = len(cat)
+    indices = np.arange(n_total)
+    np.random.default_rng(42).shuffle(indices)
+    val_idx = np.sort(indices[:int(n_total * VAL_SPLIT)])
+    print(f"{n_total} examples, {len(val_idx)} validation")
+ 
+    # predictions + per-sample image diagnostics, read in chunks
+    preds, labels, diag = [], [], []
+    yy, xx = np.mgrid[:grid_N, :grid_N]
+    c0 = grid_N // 2                                          # far-field zero / target pixel
+    r = np.hypot(xx - c0, yy - c0)
+    bucket = r <= grid_N / 40                                 # same bucket as the optimizer
+    core = r <= 256 * grid_N / 1024                           # holds ~99% of the power
+    with h5py.File(H5, 'r') as f:
+        for s in range(0, len(val_idx), 32):
+            idx = val_idx[s:s + 32]
+            imgs = f['images'][idx].astype(np.float32)
+            labels.append(f['labels'][idx].astype(np.float64))
+            preds.append(predict_outer_phases(model, imgs, norm_scale, crop))
+            for I in imgs:
+                tot = I.sum()
+                cy, cx = (I * yy).sum() / tot, (I * xx).sum() / tot
+                diag.append({'centroid_offset_px': float(np.hypot(cx - c0, cy - c0)),
+                             'bucket_power_frac': float(I[bucket].sum() / tot),
+                             'outside_core_frac': float(1 - I[core].sum() / tot),
+                             'peak_over_mean_bucket': float(I.max() / I[bucket].mean()),
+                             'image_contrast': float(I.std() / I.mean())})
+            print(f"  {min(s + 32, len(val_idx))}/{len(val_idx)}", end='\r', flush=True)
+    preds, labels = np.concatenate(preds), np.concatenate(labels)
+    cmp_ = twin_aware_compare(preds, labels, perm)
+    mae = cmp_['err_deg'].mean(1)
+    print(f"\nval MAE (twin-aware, should match the log's best): {mae.mean():.2f}°")
+ 
+    # assemble per-sample table
+    df = pd.DataFrame(diag)
+    df.insert(0, 'h5_index', val_idx)
+    df['mae_deg'] = mae
+    df['max_laser_err_deg'] = cmp_['err_deg'].max(1)
+    df['n_lasers_over_60deg'] = (cmp_['err_deg'] > 60).sum(1)
+    df['twin_branch_used'] = cmp_['use_twin']
+    df['branch_gap'] = cmp_['branch_gap']                      # ~0 => twin choice is a coin flip
+    df['label_to_twin_deg'] = np.degrees(np.abs(wrap(labels + labels[:, perm]))).mean(1)
+    df['label_spread_deg'] = np.degrees(np.abs(wrap(labels))).mean(1)
+    sub = cat.set_index('index').loc[val_idx]
+    df['bucket_gain'] = (sub['best_intensity'] / sub['init_intensity']).values
+    df['iterations'] = sub['iterations'].values
+    for k in range(labels.shape[1]):
+        df[f'true_{k}_deg'] = np.degrees(cmp_['eff'][:, k])
+        df[f'pred_{k}_deg'] = np.degrees(preds[:, k])
+    df = df.sort_values('mae_deg', ascending=False).reset_index(drop=True)
+    out_dir = Path(f'outputs/analysis/{run_label}')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_dir / 'val_errors_ranked.csv', index=False)
+ 
+    # summaries
+    q = np.percentile(mae, [50, 75, 90, 95, 99])
+    print("per-sample MAE percentiles 50/75/90/95/99: " + " / ".join(f"{v:.1f}°" for v in q))
+    for thr in (30, 60, 90):
+        print(f"  samples with MAE > {thr}°: {(mae > thr).mean() * 100:.1f}%")
+    worst = df['mae_deg'] >= np.percentile(mae, 95)
+    print(f"  share of total error carried by the worst 5%: "
+          f"{df.loc[worst, 'mae_deg'].sum() / df['mae_deg'].sum() * 100:.1f}%")
+    print(f"  MAE without the worst 5%: {df.loc[~worst, 'mae_deg'].mean():.2f}°")
+    print(f"  worst 5%: errors spread over {df.loc[worst, 'n_lasers_over_60deg'].mean():.1f} "
+          f"lasers on average (6 = whole sample wrong, 1 = one laser wrong)")
+ 
+    print("\nwhat distinguishes the worst 5%   [median: worst 5% | rest]   Spearman rho with MAE")
+    cols = ['label_to_twin_deg', 'branch_gap', 'bucket_gain', 'label_spread_deg',
+            'centroid_offset_px', 'bucket_power_frac', 'outside_core_frac',
+            'peak_over_mean_bucket', 'image_contrast', 'iterations']
+    for c in cols:
+        rho = df[c].rank().corr(df['mae_deg'].rank())
+        print(f"  {c:24s} {df.loc[worst, c].median():10.4g} | {df.loc[~worst, c].median():10.4g}   rho {rho:+.2f}")
+    print(f"\nranked table: {out_dir / 'val_errors_ranked.csv'}")
+ 
+    # plot the worst K: centre crop, log scale, with true vs predicted phases
+    from matplotlib.colors import LogNorm
+    K = min(K, len(df))
+    ncol = 5
+    nrow = int(np.ceil(K / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 4.8 * nrow))
+    h = 256 * grid_N // 1024
+    with h5py.File(H5, 'r') as f:
+        for j, ax in enumerate(np.atleast_1d(axes).ravel()):
+            ax.axis('off')
+            if j >= K:
+                continue
+            row = df.iloc[j]
+            I = f['images'][int(row['h5_index'])][c0 - h:c0 + h, c0 - h:c0 + h]
+            ax.imshow(I, cmap='plasma', origin='lower', norm=LogNorm(vmin=I.max() * 1e-4, vmax=I.max()))
+            t = ' '.join(f"{row[f'true_{k}_deg']:.0f}" for k in range(labels.shape[1]))
+            p = ' '.join(f"{row[f'pred_{k}_deg']:.0f}" for k in range(labels.shape[1]))
+            ax.set_title(f"#{int(row['h5_index'])}  MAE {row['mae_deg']:.0f}°  gain {row['bucket_gain']:.2f}\n"
+                         f"true {t}\npred {p}", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_dir / f'worst_{K}.png', dpi=120)
+    plt.close(fig)
+    print(f"worst-{K} figure: {out_dir / f'worst_{K}.png'}")
+ 
+ 
+# ----------------------------------------------------------------------------
+# Branch 2: bucket power delivered by the network on fresh realizations
+# ----------------------------------------------------------------------------
+if choice == "nn_bucket_eval":
+    run_label = input("Run label to evaluate (e.g. training_twin_v4)?\n").strip()
+    grid_N = int(input("Grid size used for the training data? (1024)\n") or 1024)
+    grid_ssl = int(input("Sampling used for the training data (0.1mm)? (20)\n") or 20)
+    fried_m = float(input("fried_mult used for the training data? (0.424)\n") or 0.424)
+    n_real = int(input("How many fresh realizations? (500 recommended)\n") or 500)
+    batch = int(input("Realizations per GPU batch? (4)\n") or 4)
+    seed = int(input("Random seed (use one never used for training data)?\n"))
+ 
+    array = ArrayDesign(2, 'hex')
+    dist = 384000000
+    sim = BeamPerturbator(ssl=grid_ssl * 1e-4, targ_pos=[0, 0, dist], array_des=array,
+                          fried_mult=fried_m, Ideal=False, grid_length=grid_N)
+    sim.input_e_field_base()
+    gen = GPUDataGenerator(sim, seed=seed)
+    model, norm_scale, outer_positions, center_idx, crop = load_trained_model(run_label, grid_N, array)
+    perm = twin_permutation(outer_positions)
+    outer = np.delete(np.arange(len(sim.base_fields)), center_idx)
+    print(f"total r0 = {(gen.r0 ** (-5 / 3)).sum() ** (-3 / 5) * 100:.1f} cm")
+ 
+    def full_phases(outer_ph):
+        ph = np.zeros(len(sim.base_fields))
+        ph[outer] = outer_ph
+        return ph
+ 
+    def power(M, ph):
+        c = np.exp(1j * ph)
+        return float(np.real(c.conj() @ M @ c))
+ 
+    rows = []
+    done = 0
+    t0 = Timer.elapsed()
+    while done < n_real:
+        B = min(batch, n_real - done)
+        screens = gen.generate_screens(tf.constant(B), gen.r0_scale)
+        F, M = gen.far_fields(screens)
+        M = M.numpy().astype(np.complex128)
+        init_imgs = gen.images(F, tf.zeros([B, gen.L], tf.float32)).numpy()
+        pred = predict_outer_phases(model, init_imgs, norm_scale, crop)
+        for b in range(B):
+            Mb = 0.5 * (M[b] + M[b].conj().T)
+            opt, P_opt, _ = optimal_phases_from_M(Mb, 100, center_idx)
+            p_nn = full_phases(pred[b])
+            p_tw = full_phases(-pred[b][perm])                # the twin of the prediction
+            P_nn, P_tw = power(Mb, p_nn), power(Mb, p_tw)
+            rows.append({'P_zero': power(Mb, np.zeros(len(p_nn))), 'P_opt': P_opt,
+                         'P_nn': P_nn, 'P_twin': P_tw, 'P_nn_resolved': max(P_nn, P_tw),
+                         'label': np.delete(opt, center_idx), 'pred': pred[b]})
+        done += B
+        el = Timer.elapsed() - t0
+        print(f"  {done}/{n_real}  ({el / done:.2f} s each)", end='\r', flush=True)
+ 
+    P = {k: np.array([r[k] for r in rows]) for k in ('P_zero', 'P_opt', 'P_nn', 'P_twin', 'P_nn_resolved')}
+    labels = np.array([r['label'] for r in rows])
+    preds = np.array([r['pred'] for r in rows])
+    cmp_ = twin_aware_compare(preds, labels, perm)
+    mae = cmp_['err_deg'].mean(1)
+ 
+    def show(name, ratio):
+        q = np.percentile(ratio, [5, 25, 50, 75, 95])
+        print(f"  {name:38s} mean {ratio.mean():.3f}  median {q[2]:.3f}   5–95%: {q[0]:.3f}–{q[4]:.3f}")
+ 
+    print(f"\n{n_real} fresh realizations   (twin-aware MAE on them: {mae.mean():.2f}°)")
+    print("bucket power relative to the optimizer's optimum:")
+    show("no correction (all phases 0)", P['P_zero'] / P['P_opt'])
+    show("NN prediction as output", P['P_nn'] / P['P_opt'])
+    show("NN + one twin-check measurement", P['P_nn_resolved'] / P['P_opt'])
+    print(f"  NN beats no-correction (twin-checked): {(P['P_nn_resolved'] > P['P_zero']).mean() * 100:.1f}% of realizations")
+    print(f"  twin of the prediction was the better one: {(P['P_twin'] > P['P_nn']).mean() * 100:.1f}%")
+    gain_opt = P['P_opt'] / P['P_zero']
+    gain_nn = P['P_nn_resolved'] / P['P_zero']
+    print(f"  gain over no correction: optimizer {np.median(gain_opt):.2f}x, NN {np.median(gain_nn):.2f}x (medians)")
+    print(f"  share of the optimizer's improvement captured by the NN (median): "
+          f"{np.median((P['P_nn_resolved'] - P['P_zero']) / np.maximum(P['P_opt'] - P['P_zero'], 1e-30)) * 100:.1f}%")
+ 
+    c_mean = 1 - cmp_['loss'].mean()                          # <cos err>, no Gaussian assumption
+    est = (7 + 12 * c_mean + 30 * c_mean ** 2) / 49
+    print(f"  analytic estimate from these errors ((7 + 12<cos> + 30<cos>^2)/49): {est:.3f}")
+ 
+    out_dir = Path(f'outputs/analysis/{run_label}')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({**{k: v for k, v in P.items()}, 'mae_deg': mae,
+                  'ratio_nn_resolved': P['P_nn_resolved'] / P['P_opt']}
+                 ).to_csv(out_dir / f'bucket_eval_seed{seed}.csv', index=False)
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    ax[0].hist(P['P_nn_resolved'] / P['P_opt'], bins=40, color='C0')
+    ax[0].set_xlabel('NN bucket power / optimal (twin-checked)')
+    ax[0].set_ylabel('realizations')
+    ax[1].scatter(mae, P['P_nn_resolved'] / P['P_opt'], s=6)
+    ax[1].set_xlabel('twin-aware MAE (deg)')
+    ax[1].set_ylabel('NN bucket power / optimal')
+    plt.tight_layout()
+    plt.savefig(out_dir / f'bucket_eval_seed{seed}.png', dpi=120)
+    plt.close(fig)
+    print(f"per-realization table and plot in {out_dir}")
+
+if choice == "ckpt_check":
+    import json, datetime
+    run_label = input("Run label (e.g. training_twin_v4)?\n").strip()
+    n_check = int(input("Validation samples to evaluate per checkpoint? (200)\n") or 200)
+    extra = input("Epoch checkpoints to also test, comma-separated (e.g. 172,448), or blank:\n").strip()
+    H5 = Path('data/testtrainingdata.h5')
+    ck_dir = Path(f'outputs/ckpts/{run_label}')
+    cfg_p = Path(f'outputs/train_logs/{run_label}_config.json')
+    log_p = Path(f'outputs/train_logs/{run_label}.csv')
+    ts = lambda p: datetime.datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S') \
+        if p.exists() else 'MISSING'
+ 
+    print("---- (1) files ----")
+    for p in (ck_dir / 'best.weights.h5', cfg_p, log_p, H5, H5.with_suffix('.catalog.csv')):
+        print(f"  {str(p):55s} modified {ts(p)}")
+    cfg = json.load(open(cfg_p))
+    print(f"  config: epochs {cfg.get('epochs')}, n_val {cfg.get('n_val')}, "
+          f"steps/epoch {cfg.get('steps_per_epoch')}, norm_scale {cfg.get('norm_scale')}")
+    if log_p.exists():
+        log = pd.read_csv(log_p)
+        b = log.loc[log['val_mae_deg'].idxmin()]
+        print(f"  CSV log: {len(log)} epochs, best val {b['val_mae_deg']:.2f}° at epoch {int(b['epoch'])}")
+    epoch_files = sorted(ck_dir.glob('epoch_*.weights.h5'))
+    print(f"  periodic checkpoints on disk: {len(epoch_files)}"
+          + (f" ({epoch_files[0].name} … {epoch_files[-1].name})" if epoch_files else ""))
+ 
+    print("---- (2) norm_scale ----")
+    cat = pd.read_csv(H5.with_suffix('.catalog.csv'))
+    n_total = len(cat)
+    idx = np.arange(n_total)
+    np.random.default_rng(42).shuffle(idx)
+    n_val = int(n_total * 0.1)
+    val_idx, train_idx = np.sort(idx[:n_val]), idx[n_val:]
+    with h5py.File(H5, 'r') as f:
+        grid_N = f['images'].shape[1]
+        s_idx = np.sort(np.random.default_rng(42).choice(train_idx, min(100, len(train_idx)), replace=False))
+        crop_cfg = cfg.get('crop', 512)
+        crop_cfg = None if (crop_cfg is None or crop_cfg >= grid_N) else int(crop_cfg)
+        ns_now = float(np.percentile(center_crop(f['images'][s_idx], crop_cfg), 99.999))
+        sel = val_idx[:n_check]
+        imgs = f['images'][sel].astype(np.float32)
+        labels = f['labels'][sel].astype(np.float64)
+    print(f"  (images cropped to {crop_cfg or grid_N} px, as make_dataset does)")
+    print(f"  recomputed from the current file: {ns_now:.4e} | saved in config: {cfg['norm_scale']:.4e} | "
+          f"n_val now {n_val} vs config {cfg.get('n_val')}")
+ 
+    print("---- (3) checkpoints on the same validation samples ----")
+    array = ArrayDesign(2, 'hex')
+    model, norm_scale, outer_positions, center_idx, crop = load_trained_model(run_label, grid_N, array)
+    perm = twin_permutation(outer_positions)
+    def val_mae(m):
+        pred = predict_outer_phases(m, imgs, norm_scale, crop)
+        return twin_aware_compare(pred, labels, perm)['err_deg'].mean()
+    print(f"  best.weights.h5: {val_mae(model):.2f}°  (on {len(sel)} val samples)")
+    for e in [int(x) for x in extra.split(',') if x.strip()]:
+        p = ck_dir / f'epoch_{e:04d}.weights.h5'
+        if p.exists():
+            model.load_weights(str(p))
+            print(f"  {p.name}: {val_mae(model):.2f}°   (modified {ts(p)})")
+        else:
+            print(f"  {p.name}: not found")
+    print("If best.weights.h5 is far above the log's best but an epoch checkpoint near the best epoch\n"
+          "matches it, best.weights.h5 was overwritten by a later run. If every checkpoint is bad, the\n"
+          "model code changed since training (layer order / sizes) - compare with the training version.")
