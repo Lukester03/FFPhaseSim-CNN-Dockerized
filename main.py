@@ -19,6 +19,7 @@ import soapy
 from keras import layers, Model
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
+from scipy import optimize
 from scipy.signal import CZT
 from numpy.fft import fft2, ifft2
 
@@ -76,34 +77,41 @@ class ArrayDesign:
 
 class TurbulenceModeler:
     def __init__(self, wavelength: float = 1064e-9, 
-    outer_scale: float = np.inf, grid_size: int = 1024, screen_physical_size: float = 2.0, grnd_speed = 5.0, fried_mult = 1.0):
+    outer_scale: float = np.inf, grid_size: int = 1024, screen_physical_size: float = 2.0, grnd_speed = 5.0, r500 = 0.05):
         self.r0_check = False
         self.phase_catalog = None
-        self.fried_mult = fried_mult
+        self.n_screens = 16
+        self.r500 = r500
         self.wavelen = wavelength
         self.outer_scale = outer_scale
         self.grid_size = grid_size
         self.pixel_scale = screen_physical_size / grid_size
         self.grnd_speed = grnd_speed
         self.v_rms = self.rms_velocity(0.0, 20.0)
+        self.b_val = optimize.brentq(lambda B: self.hv_fried_param(0, 20000, b_val = B) - self.r500, 0, 1e4)
 
     def rms_velocity(self, h1_km: float, h2_km: float):
         h = np.linspace(h1_km, h2_km, 2001)
         V = self.grnd_speed + 30 * np.exp(-((h - 9.4) / 4.8) ** 2)
         return np.sqrt(np.trapz(y=V ** 2, x=h) / (h2_km - h1_km))
+    
+    def cn2(self, h_km, v_rms, b_val = None):
+        b = self.b_val if b_val is None else b_val
+        return (5.94e-23 * h_km ** 10 * (v_rms / 27) ** 2 * np.exp(-h_km)
+               + self.b_val * 2.7e-16 * np.exp(-2 * h_km / 3))
 
-    def hv_fried_param(self, height1, height2, b_value):
-        h_km = np.linspace(height1 / 1000, height2 / 1000, num=30)
-        cn2 = (5.94e-23 * h_km ** 10 * (self.v_rms / 27) ** 2 * np.exp(-h_km)
-               + b_value * 2.7e-16 * np.exp(-2 * h_km / 3))
+    def hv_fried_param(self, height1, height2, wavelen = 500e-9, b_val=None):
+        h_km = np.linspace(height1 / 1000, height2 / 1000, num=100)
+        cn2 = self.cn2(h_km, self.v_rms, b_val)
         integral = np.trapz(y=cn2, x=h_km * 1000)          # dh in metres
-        k_wavenum = 2 * np.pi / self.wavelen
-        return (0.423 * k_wavenum ** 2 * integral) ** (-3 / 5) * self.fried_mult
+        k_wavenum = 2 * np.pi / wavelen
+        return (0.423 * k_wavenum ** 2 * integral) ** (-3 / 5)
+    
+    def layer_r0(self, h1, h2):
+        return self.hv_fried_param(h1, h2, self.b_val, self.wavelen)
 
-    def phase_screen_gen(self, height1, height2, b_val = None):
-        if b_val == None:
-            b_val = 1
-        r0 = self.hv_fried_param(height1, height2, b_val)
+    def phase_screen_gen(self, height1, height2):
+        r0 = self.layer_r0(height1, height2)
         phase_screens = soapy.atmosphere.makePhaseScreens(
             nScrns=1,
             r0=r0,
@@ -117,15 +125,14 @@ class TurbulenceModeler:
 
         return phase_screens[0], r0
 
-    def all_screen_gen(self, b_val = None, gen_height = 20000):
+    def all_screen_gen(self, gen_height = 20000):
         r0_total = 0
-        screen_count = 16
         nx = self.grid_size
-        self.phase_catalog = np.zeros((screen_count, nx, nx))
-        screen_heights = np.linspace(0, gen_height, num = (screen_count+1))
+        self.phase_catalog = np.zeros((self.n_screens, nx, nx))
+        screen_heights = np.linspace(0, gen_height, num = (self.n_screens+1))
         self.v_rms = self.rms_velocity(0.0, gen_height / 1000)
-        for i in range(screen_count):
-            phase_screen, r0 = self.phase_screen_gen(b_val = b_val, height1 = screen_heights[i], 
+        for i in range(self.n_screens):
+            phase_screen, r0 = self.phase_screen_gen(height1 = screen_heights[i], 
             height2 = screen_heights[i+1])
             r0_total += r0 ** (-5/3)
             self.phase_catalog[i] = phase_screen
@@ -134,17 +141,16 @@ class TurbulenceModeler:
             self.r0_check = True
 
 class BeamPerturbator:
-    def __init__(self, ssl, targ_pos: list, array_des: ArrayDesign, grid_length: np.float64 = 1024, Ideal = True, fried_mult = 1.0):
-        self.waist = self.atmo_height = self.apert_radi = self.wavelength = self.spatial_samp_length = np.float64(0)
+    def __init__(self, ssl, targ_pos: list, array_des: ArrayDesign, grid_length: np.float64 = 1024, Ideal = True, r500 = 0.05):
+        self.waist = self.atmo_height = self.apert_radi = self.wavelength = self.spatial_samp_length = self.n_screens = np.float64(0)
         self.chan_amps = self.turb_model = self.base_fields = None
         self.phase_screens = self.apply_turb = self.h_layers = None
         self.target_position = targ_pos
         self.rel_array = array_des
         self.center_idx = self.rel_array.find_center_index()
         self.grid_length = grid_length
-        self.set_rel_phases()
         self.chan_rel_phases = np.zeros(self.rel_array.arrayvector.shape[0])
-        self.set_beam_elements(ideal = Ideal, fried_mult = fried_mult, ssl = ssl)
+        self.set_beam_elements(ideal = Ideal, r500 = r500, ssl = ssl)
 
     def set_beam_elements(self,
                           clip_ratio: np.float64 = 0.6,
@@ -154,8 +160,9 @@ class BeamPerturbator:
                           ssl: np.float64 = 4e-4,
                           ideal: bool = True,
                           gaussian: bool = True,
-                          fried_mult = 1.0):
+                          r500 = 0.05):
         self.chan_amps = np.full(self.rel_array.arrayvector.shape[0], init_amp)
+        self.r500 = r500
         self.atmo_height = 20000
         self.base_fields = []
         self.waist = apert_radi * clip_ratio
@@ -175,12 +182,13 @@ class BeamPerturbator:
         if not ideal:
             self.turb_model = TurbulenceModeler(wavelength = wavelength, grid_size = self.grid_length,
                                                 screen_physical_size=self.grid_length * self.spatial_samp_length,
-                                                fried_mult=fried_mult)
+                                                r500 = r500)
+            self.n_screens = self.turb_model.n_screens
             self.generate_turbulence()
             self.generate_transfer()
         
-    def generate_turbulence(self, b_val = 1):
-        self.turb_model.all_screen_gen(b_val = b_val)
+    def generate_turbulence(self):
+        self.turb_model.all_screen_gen()
         self.phase_screens = self.turb_model.phase_catalog.copy()
 
     def generate_transfer(self):
@@ -189,7 +197,7 @@ class BeamPerturbator:
         fy = np.fft.fftfreq(dim, d=self.spatial_samp_length)
         FX, FY = np.meshgrid(fx, fy)
         k = 2*np.pi/self.wavelength
-        screen_heights = np.linspace(0, min(self.target_position[2], self.atmo_height), num=len(self.phase_screens)+1)
+        screen_heights = np.linspace(0, min(self.target_position[2], self.atmo_height), num=self.n_screens+1)
         self.h_layers = []
         z_current = 0.0
         for h in screen_heights[1:]:
@@ -197,13 +205,6 @@ class BeamPerturbator:
             H = np.exp(1j * k * dz) * np.exp(-1j * np.pi * self.wavelength * dz * (FX ** 2 + FY ** 2))
             self.h_layers.append(H)
             z_current = h
-
-    def set_rel_phases(self,
-                       rel_phases=None):
-        if rel_phases is not None:
-            self.chan_rel_phases = rel_phases
-        else:
-            self.chan_rel_phases = np.zeros(self.rel_array.arrayvector.shape[0])
 
     def input_e_field_base(self):
         self.base_fields = []
@@ -242,116 +243,6 @@ class BeamPerturbator:
             total_phase = phi_steer + piston[n]
             self.base_fields.append(amp_prof * self.chan_amps[n] * np.exp(1j * total_phase))
         return x, y
-
-    def input_e_quick(self):
-        input_e = np.zeros_like(self.base_fields[0], dtype=np.complex128)
-        for n, base in enumerate(self.base_fields):
-            input_e += base * np.exp(1j * self.chan_rel_phases[n])
-        return input_e
-
-    def fresnel_czt(self, input_field, z: np.float64, k):
-        dim_y, dim_x = input_field.shape
-        ssl = self.spatial_samp_length
-        x1 = (np.arange(dim_x) - dim_x / 2) * ssl
-        y1 = (np.arange(dim_y) - dim_y / 2) * ssl
-        X1, Y1 = np.meshgrid(x1,y1)
-        Q1 = np.exp((1j * k * (X1 ** 2 + Y1 ** 2)) / (2 * z))
-        array_extent = (self.element_positions[:,0].max() - self.element_positions[:,0].min())
-        d_array = array_extent + 2 * self.apert_radi
-        diff_limited_spot = self.wavelength * z / d_array
-        out_window = 20 * diff_limited_spot
-        E_mod = input_field * Q1
-        out_size = self.grid_length
-        out_center = [0,0]
-        dx_out = out_window / out_size
-        x2 = out_center[0] + (np.arange(out_size) - out_size // 2) * dx_out
-        y2 = out_center[1] + (np.arange(out_size) - out_size // 2) * dx_out
-        def make_czt(f_axis, n_in):
-            df, f0 = f_axis[1] - f_axis[0], f_axis[0]
-            W = np.exp(-1j * 2 * np.pi * df * ssl)
-            A = np.exp(1j * 2 * np.pi * f0 * ssl)
-            return CZT(n_in, out_size, W, A)
-        tmp = make_czt(x2 / (self.wavelength * z), dim_x)(E_mod, axis=1)
-        tmp = make_czt(y2 / (self.wavelength * z), dim_y)(tmp, axis=0)
-        prefactor = np.exp(1j * k * z) / (1j * self.wavelength * z)
-        X2, Y2 = np.meshgrid(x2, y2)
-        Q2 = np.exp(1j * k * (X2 ** 2 + Y2 ** 2) / (2 * z))
-        output_field = prefactor * Q2 * tmp * ssl ** 2
-        return output_field, x2, y2
-
-    def fresnel_propagation(self, input_field, z: np.float64):
-        dim_y, dim_x = input_field.shape
-        ssl = self.spatial_samp_length
-        k = 2 * np.pi / self.wavelength
-        if self.apply_turb:
-            z_atmo = min(z, self.atmo_height)
-            screen_num = min(len(self.phase_screens), int(round(z/500)))
-            field = input_field.copy()
-            screen_heights = np.linspace(0, z_atmo, num = screen_num + 1)
-            z_current = 0.0
-            for n in range(screen_num):
-                z_current = screen_heights[n+1]
-                field = ifft2(fft2(field) * self.h_layers[n])
-                field *= np.exp(1j * self.phase_screens[n])
-            dist_remainder = z-z_current
-            if dist_remainder > 0:
-                return self.fresnel_czt(input_field = field, z = dist_remainder, k = k)
-            else:
-                x_out = (np.arange(dim_x) - dim_x / 2) * ssl
-                y_out = (np.arange(dim_y) - dim_y / 2) * ssl
-                return field, x_out, y_out
-        return self.fresnel_czt(input_field = input_field, z = z, k = k)
-
-    def compute_optimal_phases(self, n_iter, tol=1e-6, return_m = False):
-        n_elem = len(self.base_fields)
-        x_f, y_f, z = self.target_position
-        bucket_radius = self.grid_length / 40
-        bucket_rows = []
-        mask = None
-        for n in range(n_elem):
-            field_out, x_out, y_out = self.fresnel_propagation(self.base_fields[n], z)
-            if mask is None:
-                cx = np.argmin(np.abs(x_out - x_f))
-                cy = np.argmin(np.abs(y_out - y_f))
-                Y, X = np.mgrid[0:field_out.shape[0], 0:field_out.shape[1]]
-                r = np.sqrt((X-cx) ** 2 + (Y-cy) ** 2)
-                mask = r <= bucket_radius
-            bucket_rows.append(field_out[mask])
-        E = np.stack(bucket_rows, axis=0)
-        M = E.conj() @ E.T
-
-        eigvals, eigvecs = np.linalg.eigh(M)
-        c = np.exp(1j * np.angle(eigvecs[:, -1]))
-
-        # baseline candidate — guarantees the result can never be worse than doing nothing
-        c_ones = np.ones(n_elem, dtype=np.complex128)
-        power_ones = np.real(c_ones.conj() @ M @ c_ones)
-
-        prev_power = -np.inf
-        power = np.real(c.conj() @ M @ c)
-        n_used = 0
-        for i in range(n_iter):
-            c = np.exp(1j * np.angle(M @ c))
-            power = np.real(c.conj() @ M @ c)
-            n_used = i + 1
-            if power - prev_power < tol * abs(power):     # relative tolerance
-                break
-            prev_power = power
-
-        ub = n_elem * eigvals[-1]
-        gap = (ub - power) / ub
-        top_eig_fraction = eigvals[-1] / np.trace(M).real
-
-        if power_ones > power:            # safety net — should basically never trigger if math is right
-            c = c_ones
-            power = power_ones
-
-        c = c * np.exp(-1j * np.angle(c[self.center_idx]))
-
-        optimal_phases = np.angle(c)
-        if return_m:
-            return optimal_phases, power, n_used, mask, M
-        return optimal_phases, power, n_used, mask
 
 class ZernikeFilterBank:
     def __init__(self, kernel_size=21, num_modes=36):
@@ -787,17 +678,24 @@ class FFPhaseCNN(Model):
         return config
 
     def call(self, inputs, training = False):
-        down_inputs = self.i_downsample(inputs, training = training)
-        zernike_down = self.zernike_conv(inputs)
-        gabor_down = self.gabor_conv(inputs)
-
-        z_features = self.zernike_processor(zernike_down, training=training)
-        g_features = self.gabor_processor(gabor_down, training=training)
-        i_features = self.intensity_processor(down_inputs, training=training)
-
-        combined = tf.concat([z_features, g_features, i_features], axis=-1)  # [B, H, W, C]
-        combined = self.pre_laser_downsample(combined, training = training)
         B = tf.shape(inputs)[0]
+        H, W, C_in = inputs.shape[1], inputs.shape[2], inputs.shape[3]
+        x = tf.reshape(tf.transpose(inputs, [0, 3, 1, 2]), [-1, H, W, 1])
+
+        down_inputs = self.i_downsample(x,training = training)
+        zernike_down = self.zernike_conv(x)
+        gabor_down = self.gabor_conv(x)
+
+        z_features = self.zernike_processor(zernike_down, training = training)
+        g_features = self.gabor_processor(gabor_down, training = training)
+        i_features = self.intensity_processor(down_inputs, training = training)
+
+        feats = tf.concat([z_features, g_features, i_features], axis=-1)
+        h, w, Fc = feats.shape[1], feats.shape[2], feats.shape[3]
+        feats = tf.reshape(feats, [B, C_in, h, w, Fc])
+        combined = tf.reshape(tf.transpose(feats, [0, 2, 3, 1, 4]), [B, h, w, C_in * Fc])
+        combined = self.pre_laser_downsample(combined, training = training)
+
         L = self.num_lasers
         pos_all = tf.constant(self.element_positions[:, :2], dtype=tf.float32)
         pos_encoded = self.sinusoidal_position_encoding(pos_all)          # [L, pos_dim]
@@ -828,7 +726,7 @@ class FFPhaseCNN(Model):
         super().build(input_shape)
 
 class DatasetStore:
-    def __init__(self, h5_path, image_shape, num_channels, flush_count = 8, initial_size = 100):
+    def __init__(self, h5_path, image_shape, num_channels, flush_count = 8, initial_size = 100, with_diversity = False):
         self.h5_path = Path(h5_path)
         self.catalog_path = self.h5_path.with_suffix('.catalog.csv')
         self.image_shape = image_shape
@@ -845,8 +743,14 @@ class DatasetStore:
                                    dtype='float32', chunks=(1, *image_shape), compression=None)
             self.f.create_dataset('opt_images', shape=(0, *image_shape), maxshape=(None, *image_shape),
                                    dtype='float32', chunks=(1, *image_shape), compression=None)
+            if with_diversity:
+                self.f.create_dataset('div_images', shape = (0, *image_shape), maxshape=(None, *image_shape),
+                                      dtype = 'float32', chunks = (1, *image_shape), compression = None)
             self.f.create_dataset('labels', shape=(0, num_channels), maxshape=(None, num_channels),
                                    dtype='float32')
+        if with_diversity and 'div_images' not in self.f:
+            raise ValueError(f"{self.h5_path} already exists without 'div_images'; write div data to new file")
+        self._ds_names = [n for n in ('images', 'opt_images', 'div_images', 'labels') if n in self.f]
         self._allocated = self.f['images'].shape[0]
         self._n = self._count_actual_examples()
 
@@ -860,15 +764,19 @@ class DatasetStore:
         current_size = self.f['images'].shape[0]
         if needed > self._allocated:
             new_size = max(needed, self._allocated * 2 if current_size > 0 else self._allocated)
-            for ds_name in ['images', 'opt_images', 'labels']:
+            for ds_name in self._ds_names:
                 self.f[ds_name].resize(new_size, axis=0)
             self._allocated = new_size
 
-    def add_example(self, image, opt_image, label_rad, **metadata):
+    def add_example(self, image, opt_image, label_rad, div_image = None,  **metadata):
+        if ('div_images' in self._ds_names) != (div_image is not None):
+            raise ValueError('pass div_image exactly when the file stores div_images')
         self._ensure_capacity(self._n+1)
         n = self._n
         self.f['images'][n] = image
         self.f['opt_images'][n] = opt_image
+        if div_image is not None:
+            self.f['div_images'][n] = div_image
         self.f['labels'][n] = label_rad
 
         row = {'index':n, **metadata}
@@ -880,7 +788,7 @@ class DatasetStore:
     
     @staticmethod
     def make_dataset(h5_path, batch_size=8, shuffle=True, val_split=0.1,
-                     intensity_clip_percentile=99.999, crop=512, pool=1):
+                     intensity_clip_percentile=99.999, crop=512, pool=1, diversity=None):
         h5_path = Path(h5_path)
  
         def reduce(imgs):
@@ -907,25 +815,27 @@ class DatasetStore:
                 np.random.default_rng(42).shuffle(indices)
             n_val = int(n_total * val_split)
             val_idx, train_idx = indices[:n_val], indices[n_val:]
- 
+            use_div = ('div_images' in f) if diversity is None else bool(diversity)
+            channels = ['images'] +(['div_images'] if use_div else [])
             n_samples = min(100, len(train_idx))
             sample_idx = np.sort(np.random.default_rng(42).choice(train_idx, n_samples, replace=False))
-            sample = reduce(f['images'][sample_idx])          # norm from the images the net actually sees
-            norm_scale = float(np.percentile(sample, intensity_clip_percentile))
+            sample = np.stack([reduce(f[c][sample_idx]) for c in channels], axis = -1)
+            norm_scale = np.percentile(sample.reshape(-1, len(channels)), intensity_clip_percentile, axis=0).astype(np.float32)
             grid_size = sample.shape[1]
         del sample
- 
+        ns = tf.constant(norm_scale, tf.float32)
+
         def preprocess(image, label):
-            image = tf.clip_by_value(image, 0.0, norm_scale) / norm_scale
-            image = tf.math.log1p(image * 1000.0)
-            return image[..., None], label
+            image = tf.clip_by_value(image, 0.0, ns) / ns
+            return tf.math.log1p(image * 1000.0), label
  
         def build(idx_array, training):
             idx_sorted = np.sort(idx_array)
             with h5py.File(h5_path, 'r') as f:
                 # read in chunks so the full 1024^2 images never sit in RAM all at once
-                all_images = np.concatenate([reduce(f['images'][idx_sorted[s:s + 64]])
-                                             for s in range(0, len(idx_sorted), 64)])
+                all_images = np.concatenate([
+                    np.stack([reduce(f[c][idx_sorted[s:s + 64]]) for c in channels], axis = -1)
+                    for s in range(0, len(idx_sorted), 64)])
                 all_labels = f['labels'][idx_sorted].astype(np.float32)
             ds = tf.data.Dataset.from_tensor_slices((all_images, all_labels))
             ds = ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
@@ -946,7 +856,7 @@ class DatasetStore:
 
     def close(self):
         self.flush()
-        for ds_name in ["images", "opt_images", 'labels']:
+        for ds_name in self._ds_names:
             self.f[ds_name].resize(self._n, axis=0)
         self.f.close()
 
@@ -974,7 +884,30 @@ def optimal_phases_from_M(M, n_iter, center_idx, tol=1e-6):
     c = c * np.exp(-1j * np.angle(c[center_idx]))
     return np.angle(c), power, n_used
  
- 
+diversity_delta = np.pi / 2
+def diversity_phases(element_positions, delta = diversity_delta):
+    pos = np.asarray(element_positions)[:,:2]
+    on_axis = (np.abs(pos[:,0]) < 1e-9) & (np.abs(pos[:,1]) > 1e-9)
+    ph = np.zeros(len(pos), np.float32)
+    ph[on_axis] = delta
+    return ph
+
+def slab_wind_speeds(sim, n_slabs):
+    """Cn^2-weighted 5/3-moment wind speed of each generation slab [m/s].
+    Uses the same Cn^2 expression as TurbulenceModeler.hv_fried_param and the
+    same wind profile as TurbulenceModeler.rms_velocity."""
+    tm = sim.turb_model
+    S_total = sim.n_screens
+    gen_h = np.linspace(0, sim.atmo_height, S_total + 1) / 1000          # km
+    v_rms = tm.rms_velocity(0.0, sim.atmo_height / 1000)
+    v = []
+    for i in range(n_slabs):
+        h = np.linspace(gen_h[i], gen_h[i + 1], 2001)
+        cns = tm.cn2(h, v_rms)
+        V = tm.grnd_speed + 30 * np.exp(-((h - 9.4) / 4.8) ** 2)
+        v.append((np.trapz(cns * V ** (5 / 3), h) / np.trapz(cns, h)) ** (3 / 5))
+    return np.array(v)
+
 class GPUDataGenerator:
     """GPU port of: TurbulenceModeler screens (aotools ft_sh_phase_screen,
     same PSD / subharmonics / scaling), BeamPerturbator.fresnel_propagation
@@ -984,7 +917,7 @@ class GPUDataGenerator:
     zero-phase image is |sum F_n|^2 and the optimized image is
     |sum e^{i phi_n} F_n|^2 -- identical to re-propagating the summed field."""
  
-    def __init__(self, sim, seed=0, b_val=1, l0=0.01):
+    def __init__(self, sim, seed=0, l0=0.01):
         if not sim.apply_turb:
             raise ValueError("sim must be built with Ideal=False")
         if not sim.base_fields:
@@ -1001,7 +934,7 @@ class GPUDataGenerator:
         k = 2 * np.pi / sim.wavelength
  
         # ---- layer bookkeeping: same as fresnel_propagation ----
-        S_total = len(sim.phase_screens)
+        S_total = sim.n_screens
         self.S = min(S_total, int(round(z / 500)))
         z_atmo = min(z, sim.atmo_height)
         self.z_rem = z - np.linspace(0, z_atmo, self.S + 1)[-1]
@@ -1012,7 +945,7 @@ class GPUDataGenerator:
         # ---- per-slab r0: same as all_screen_gen / phase_screen_gen ----
         gen_h = np.linspace(0, sim.atmo_height, S_total + 1)
         tm.v_rms = tm.rms_velocity(0.0, sim.atmo_height / 1000)
-        r0 = np.array([tm.hv_fried_param(gen_h[i], gen_h[i + 1], b_val)
+        r0 = np.array([tm.layer_r0(gen_h[i], gen_h[i + 1])
                        for i in range(S_total)])[:self.S]
         self.r0 = r0
         self.r0_scale = tf.constant((r0 ** (-5 / 6)).astype(np.float32))   # sqrt(r0^-5/3)
@@ -1117,9 +1050,85 @@ class GPUDataGenerator:
         """phases [B, L] float32 -> |sum_n e^{i phi_n} F_n|^2, [B, N, N]."""
         ph = tf.complex(tf.cos(phases), tf.sin(phases))
         return tf.abs(tf.einsum('bl,bljk->bjk', ph, F)) ** 2
+    
+    def set_wind(self, directions='aligned', seed=0):
+        """Wind velocity per layer, [S, 2] m/s as (vx, vy).
+        directions: 'aligned' = every layer blows along +x; 'random' = an
+        independent uniform azimuth per layer; or an array of S angles (rad).
+        Returns tau0 from 6.88 sum_n (v_n tau / r0_n)^(5/3) = 1."""
+        speed = slab_wind_speeds(self.sim, self.S)
+        if isinstance(directions, str) and directions == 'aligned':
+            ang = np.zeros(self.S)
+        elif isinstance(directions, str) and directions == 'random':
+            ang = np.random.default_rng(seed).uniform(0, 2 * np.pi, self.S)
+        else:
+            ang = np.asarray(directions, dtype=np.float64)
+        self.wind_speed, self.wind_angle = speed, ang
+        self.wind = np.stack([speed * np.cos(ang), speed * np.sin(ang)], axis=1)
+        dz = min(self.sim.target_position[2], self.sim.atmo_height) / len(self.sim.phase_screens)
+        self.layer_heights = (np.arange(self.S) + 1) * dz   # screen n sits after n+1 propagation steps
+        N, delta = self.N, self.sim.turb_model.pixel_scale
+        fx = np.arange(-N / 2, N / 2) / (N * delta)
+        FX, FY = np.meshgrid(fx, fx)                         # FX varies along columns (x)
+        self.FXg = tf.constant(FX.astype(np.float32))
+        self.FYg = tf.constant(FY.astype(np.float32))
+        D = N * delta
+        self.F3 = tf.constant(np.stack([np.arange(-1, 2) / (3 ** p * D) for p in range(1, 4)]
+                                       ).astype(np.float32))  # [3 levels, 3]
+        self.screen_period = D
+        return (6.88 * np.sum((speed / self.r0) ** (5 / 3))) ** (-3 / 5)
+ 
+    def max_time_s(self):
+        """Longest sequence before the fastest layer's FFT part repeats."""
+        return self.screen_period / self.wind_speed.max()
+ 
+    def draw_screen_coeffs(self, B):
+        """Random coefficients for B realizations, drawn in the same order as
+        generate_screens. Returns hi [B, S, N, N] and lo [B, S, 3, 3, 3] complex64."""
+        N = self.N
+        hi, lo = [], []
+        for n in range(self.S):
+            g = self.rng.normal([B, 2, N, N])
+            hi.append(tf.complex(g[:, 0], g[:, 1]) * tf.cast(self.amp_hi * self.r0_scale[n], tf.complex64))
+            levels = []
+            for p in range(3):
+                g3 = self.rng.normal([B, 2, 3, 3])
+                levels.append(tf.complex(g3[:, 0], g3[:, 1])
+                              * tf.cast(self.amp_lo[p] * self.r0_scale[n], tf.complex64))
+            lo.append(tf.stack(levels, axis=1))
+        return tf.stack(hi, axis=1), tf.stack(lo, axis=1)
+ 
+    @tf.function
+    def screens_from_coeffs(self, hi_c, lo_c, shift, remove_mean=True):
+        """Screens [B, S, N, N] (rad) with layer n translated by shift[n] = (dx, dy) metres.
+        shift = wind * t gives frozen flow at time t. remove_mean=True matches
+        generate_screens; the mean is a piston common to all elements and never
+        changes the images or bucket power. Use False only for structure-function
+        checks."""
+        N = self.N
+        two_pi = 2 * np.pi
+        shift = tf.cast(shift, tf.float32)
+        out = []
+        for n in range(self.S):
+            dx, dy = shift[n, 0], shift[n, 1]
+            ramp = tf.exp(tf.complex(tf.zeros_like(self.FXg), -two_pi * (self.FXg * dx + self.FYg * dy)))
+            cn = hi_c[:, n] * ramp
+            hi = tf.math.real(tf.signal.ifftshift(
+                tf.signal.ifft2d(tf.signal.fftshift(cn, axes=(-2, -1))), axes=(-2, -1))) * float(N * N)
+            lo = tf.zeros(tf.shape(hi), tf.complex64)
+            for p in range(3):
+                f3 = self.F3[p]
+                ph = -two_pi * (f3[:, None] * dy + f3[None, :] * dx)          # [i (y freq), j (x freq)]
+                c3 = lo_c[:, n, p] * tf.exp(tf.complex(tf.zeros_like(ph), ph))
+                lo += tf.einsum('ir,bij,jc->brc', self.U[p], c3, self.U[p])
+            lo = tf.math.real(lo)
+            if remove_mean:
+                lo -= tf.reduce_mean(lo, axis=[1, 2], keepdims=True)
+            out.append(hi + lo)
+        return tf.stack(out, axis=1)
  
     # ------------------------------------------------------------------
-    def run_batch(self, B, n_iter=100, screens=None):
+    def run_batch(self, B, n_iter=100, screens=None, div_phases=None):
         """Returns list of per-realization dicts matching the CPU generator's outputs."""
         if screens is None:
             screens = self.generate_screens(tf.constant(B), self.r0_scale)
@@ -1127,6 +1136,10 @@ class GPUDataGenerator:
         M = M.numpy().astype(np.complex128)
         zeros = tf.zeros([B, self.L], tf.float32)
         init_imgs = self.images(F, zeros).numpy()
+        div_imgs = None
+        if div_phases is not None:
+            div = tf.tile(tf.constant(np.asarray(div_phases,np.float32)[None]), [B,1])
+            div_imgs = self.images(F, div).numpy()
         results, phases = [], np.zeros((B, self.L), np.float32)
         for b in range(B):
             Mb = 0.5 * (M[b] + M[b].conj().T)                 # remove float32 asymmetry
@@ -1139,27 +1152,14 @@ class GPUDataGenerator:
             results[b]['opt_image'] = opt_imgs[b]
             results[b]['init_intensity'] = float(np.mean(init_imgs[b][self.mask]))
             results[b]['best_intensity'] = float(np.mean(opt_imgs[b][self.mask]))
+            if div_imgs is not None:
+                results[b]['div_image'] = div_imgs[b]
         return results, screens
 
 REF_FRINGE_PX = 35
 
 def fringe_geometry(array, apert_radi=0.05, clip_ratio=0.6, grid_N=1024, verbose=True):
-    """Analytic sizes, in output pixels, of the structures in the far-field image.
- 
-    BeamPerturbator.fresnel_czt samples the far field with a window of
-    20*lambda*z/d_array across grid_N pixels, d_array = (x-extent of the element
-    centres) + 2*apert_radi. A far-field length lambda*z*X (X in 1/m) therefore
-    spans X * d_array * grid_N / 20 pixels, independent of wavelength and
-    distance (up to z/(z - 20 km) = 1.00005).
- 
-      fringe from a baseline b          : X = 1/b
-      single-element Gaussian envelope  : 1/e^2 intensity radius, X = 1/(pi*w0),
-                                          w0 = clip_ratio*apert_radi
-                                          (the aperture truncation makes the real
-                                          envelope ~7% wider)
-      hard-aperture Airy first zero     : X = 1.22/(2*apert_radi)
-    """
-    pitch = 2 * apert_radi                                    # BeamPerturbator.element_space
+    pitch = 2 * apert_radi
     pos = np.asarray(array.arrayvector)[:, :2] * pitch
     d_array = (pos[:, 0].max() - pos[:, 0].min()) + 2 * apert_radi
     px = lambda X: X * d_array * grid_N / 20.0
@@ -1176,22 +1176,25 @@ def fringe_geometry(array, apert_radi=0.05, clip_ratio=0.6, grid_N=1024, verbose
 def center_crop(imgs, crop):
     """[n, G, G] -> central [n, crop, crop]; crop=None or >= G returns imgs unchanged.
     Must match make_dataset's crop (c0 = (G - crop) // 2)."""
-    if crop is None or crop >= imgs.shape[-1]:
+    G = imgs.shape[1]
+    if crop is None or crop >= G:
         return imgs
-    c0 = (imgs.shape[-1] - crop) // 2
-    return imgs[..., c0:c0 + crop, c0:c0 + crop]
- 
+    c0 = (G - crop) // 2
+    return imgs[:, c0:c0 + crop, c0:c0 + crop, ...]
+
+def read_run_config(run_label):
+    import json
+    with open(f'outputs/train_logs/{run_label}_config.json') as f:
+        return json.load(f) 
  
 def load_trained_model(run_label, grid_N, array):
     """Rebuild the model exactly as the training branch does and load best weights.
     grid_N is the size of the STORED images; the model is built for the size it was
     trained on (the crop, if make_dataset cropped).
     Returns (model, norm_scale, outer_positions, center_idx, crop)."""
-    import json
-    cfg_path = f'outputs/train_logs/{run_label}_config.json'
-    with open(cfg_path) as f:
-        cfg = json.load(f)
-    norm_scale = float(cfg['norm_scale'])
+    cfg = read_run_config(run_label)
+    norm_scale = np.atleast_1d(np.asarray(cfg['norm_scale'], dtype=np.float32))   # one per input image
+    C_in = len(norm_scale)
     # make_dataset's default is crop=512, pool=1; record 'crop' in the config to override
     crop = cfg.get('crop', 512)
     crop = None if (crop is None or crop >= grid_N) else int(crop)
@@ -1201,22 +1204,26 @@ def load_trained_model(run_label, grid_N, array):
     geom = fringe_geometry(array, grid_N=grid_N, verbose=False)
     scale = max(1, int(round(geom['fringe_nearest_px'] / REF_FRINGE_PX)))
     model = FFPhaseCNN(laser_count=len(outer_positions), element_positions=outer_positions, scale=scale)
-    model.build(input_shape=(1, in_N, in_N, 1))
+    model.build(input_shape=(1, in_N, in_N, C_in))
     model.load_weights(f'outputs/ckpts/{run_label}/best.weights.h5')
     print(f"loaded {run_label}: scale {scale}, stored images {grid_N}x{grid_N}, "
-          f"network input {in_N}x{in_N} ({'centre crop' if crop else 'full image'}), "
-          f"norm_scale {norm_scale:.3e}")
+          f"network input {in_N}x{in_N}x{C_in} ({'centre crop' if crop else 'full image'}"
+          f"{', + diversity image' if C_in == 2 else ''}), norm_scale {np.round(norm_scale, 12).tolist()}")
     return model, norm_scale, outer_positions, center_idx, crop
  
  
 def preprocess_images(imgs, norm_scale):
-    """Same transform as make_dataset's preprocess: [n, N, N] -> [n, N, N, 1] float32."""
+    """Same transform as make_dataset's preprocess. imgs [n, N, N] (one image) or
+    [n, N, N, C] (zero-phase + diversity); norm_scale has one value per channel."""
     imgs = np.asarray(imgs, dtype=np.float32)
-    return (np.log1p(np.clip(imgs, 0.0, norm_scale) / norm_scale * 1000.0))[..., None]
+    if imgs.ndim == 3:
+        imgs = imgs[..., None]
+    ns = np.atleast_1d(np.asarray(norm_scale, dtype=np.float32))
+    return np.log1p(np.clip(imgs, 0.0, ns) / ns * 1000.0)
  
  
 def predict_outer_phases(model, imgs, norm_scale, crop=None, batch=8):
-    """[n, N, N] raw intensity -> [n, L] predicted outer phases (rad).
+    """[n, N, N] or [n, N, N, C] raw intensity -> [n, L] predicted outer phases (rad).
     crop must be the crop the model was trained with (from load_trained_model)."""
     out = []
     for s in range(0, len(imgs), batch):
@@ -1367,7 +1374,11 @@ def twin_invariant_loss(y_true, y_pred, perm, reduce=True):
     eff = tf.where(use_twin[:, None], tw, y_true)
     return (tf.reduce_mean(l_min) if reduce else l_min), eff
  
- 
+def direct_phase_loss(y_true, y_pred, reduce=True):
+    target = tf.stack([tf.cos(y_true), tf.sin(y_true)], axis = -1)
+    l = tf.reduce_mean(1.0 - tf.reduce_sum(target * y_pred, axis=-1), axis=1)
+    return (tf.reduce_mean(l) if reduce else l), y_true
+
 def twin_floor_deg(labels, perm):
     """Best achievable *standard* MAE (deg) for any image-only predictor if the
     image cannot distinguish phi from twin(phi): predict the circular midpoint."""
@@ -1376,13 +1387,148 @@ def twin_floor_deg(labels, perm):
     err = np.abs(np.angle(np.exp(1j * (labels - mid))))
     return float(np.degrees(err).mean())
 
+def interp_traces(t_coarse, X, t):
+    """X [K, ...] sampled at uniform times t_coarse [K] -> X(t) by linear interpolation."""
+    dt = t_coarse[1] - t_coarse[0]
+    s = min(max((t - t_coarse[0]) / dt, 0.0), len(t_coarse) - 1 - 1e-9)
+    k = int(s)
+    w = s - k
+    return (1 - w) * X[k] + w * X[k + 1]
+ 
+ 
+def ou_step(x, dt, tau, sigma, rng):
+    """One exact step of an Ornstein-Uhlenbeck process: rms sigma, correlation time tau."""
+    if sigma == 0:
+        return x
+    a = np.exp(-dt / tau)
+    return x * a + sigma * np.sqrt(1 - a * a) * rng.standard_normal(x.shape)
+ 
+ 
+def bucket_power_batch(M, phases):
+    """M [B, L, L] complex, phases [..., B, L] (rad) -> Re(c^H M c) [..., B]."""
+    c = np.exp(1j * phases)
+    return np.real(np.einsum('...bi,bij,...bj->...b', c.conj(), M, c))
+ 
+ 
+def camera_frames(clean, kappa, sigma_read, rng):
+    """clean [b, H, W, C] simulated intensity -> noisy frame in simulation units:
+    Poisson(kappa * I) + Normal(0, sigma_read), divided back by kappa. Same camera
+    model as photon_budget (1x1 binning, no background)."""
+    counts = rng.poisson(kappa * clean.astype(np.float64)).astype(np.float64)
+    if sigma_read > 0:
+        counts += rng.normal(0.0, sigma_read, counts.shape)
+    return (counts / kappa).astype(np.float32)
+
+def simulate_spgd(trace, cfg, rng):
+    t_c, M_c, Popt_c, v_c = trace['t'], trace['M'], trace['P_opt'], trace['v']
+    outer = trace['outer']
+    B, L = M_c.shape[1], M_c.shape[2]
+    T = t_c[-1]
+    gains = np.repeat(np.asarray(cfg['gains'], float), len(cfg['dithers']))
+    dithers = np.tile(np.asarray(cfg['dithers'], float), len(cfg['gains']))
+    G = len(gains)
+    gam, dlt = gains[:, None, None], dithers[:, None, None]
+    t_meas = 0.5 / cfg['f_iter']                       # two measurements per iteration
+    n_half = int(T / t_meas)
+    alpha = 1.0 if np.isinf(cfg['f_act']) else 1 - np.exp(-2 * np.pi * cfg['f_act'] * t_meas)
+    R = cfg['act_range']
+    tau_psi = 1 / (2 * np.pi * cfg['f_psi']) if cfg['f_psi'] > 0 else np.inf
+    eps_rx = 1 + cfg['sigma_cal'] * rng.standard_normal((B, L))
+    eps_tx = 1 + cfg['sigma_cal'] * rng.standard_normal((B, L))
+    eps_rx[:, [i for i in range(L) if i not in outer]] = 1
+    eps_tx[:, [i for i in range(L) if i not in outer]] = 1
+    psi = cfg['sigma_psi'] * rng.standard_normal((B, L)) if cfg['sigma_psi'] > 0 else np.zeros((B, L))
+    T_ret_c = np.sum(np.abs(v_c) ** 2, axis=2)          # [K, B]
+    k_d = int(cfg['delay_iter'])
+    scale = cfg['phi_rate'] * t_meas / cfg['J_ref']     # mean photons per unit metric per sample
+ 
+    def full(x):                                        # [..., B, L-1] outer -> [..., B, L]
+        out = np.zeros(x.shape[:-1] + (L,))
+        out[..., outer] = x
+        return out
+ 
+    def measure(J):
+        n = rng.poisson(np.maximum(J, 0) * scale).astype(float)
+        if cfg['sigma_det'] > 0:
+            n += rng.normal(0.0, cfg['sigma_det'], n.shape)
+        return n
+ 
+    u = np.zeros((G, B, L - 1))                         # SPGD's commanded mean phases
+    a = np.zeros((G, B, L - 1))                         # what the actuators actually apply
+    s = np.ones((G, B, L - 1))
+    J_plus = np.zeros((G, B))
+    hist = []                                           # (J+, J-, s) per iteration, for the delay
+    ratio_spgd = np.zeros((G, n_half))
+    ratio_nn = np.zeros(n_half)
+    ratio_zero = np.zeros(n_half)
+    steady_spgd = np.zeros((G, B))
+    steady_nn = np.zeros(B)
+    n_steady = 0
+    nn = trace.get('nn')
+    for h in range(n_half):
+        t = h * t_meas
+        M = interp_traces(t_c, M_c, t)
+        P_opt = interp_traces(t_c, Popt_c, t)
+        psi = ou_step(psi, t_meas, tau_psi, cfg['sigma_psi'], rng)
+        if h % 2 == 0:
+            s = rng.choice([-1.0, 1.0], size=(G, B, L - 1))
+            cmd = u + dlt * s
+        else:
+            cmd = u - dlt * s
+        a = a + alpha * (cmd - a)
+ 
+        # ---- the metric SPGD measures ----
+        if cfg['mode'] == 'beacon':
+            J = bucket_power_batch(M, eps_rx * full(a))
+            tx = eps_tx * full(u) + psi                 # transmit copies the undithered setting
+        else:
+            tx = eps_tx * full(a) + psi                 # the transmit itself carries the dither
+            v = interp_traces(t_c, v_c, t)
+            t_ret = t + cfg['t_rt']
+            T_ret = interp_traces(t_c, T_ret_c, t_ret) if t_ret <= T else np.zeros(B)
+            J = np.abs(np.einsum('gbl,bl->gb', np.exp(1j * tx), v)) ** 2 * T_ret
+        Jm = measure(J)
+        if h % 2 == 0:
+            J_plus = Jm
+        else:
+            hist.append((J_plus, Jm, s))
+            m = len(hist) - 1 - k_d                     # measurement that has arrived by now
+            if m >= 0:
+                Jp, Jn, s_old = hist[m]
+                tot = Jp + Jn
+                g = np.where(tot > 0, (Jp - Jn) / np.where(tot > 0, tot, 1.0), 0.0)
+                u = u + gam * g[..., None] * s_old
+                if np.isfinite(R):                      # actuator stroke reset by 2 pi
+                    u = np.where(u > R, u - 2 * np.pi, np.where(u < -R, u + 2 * np.pi, u))
+                hist[m] = None                          # used; free it
+ 
+        # ---- what the transmit actually delivers ----
+        P_tx = bucket_power_batch(M, tx)                # [G, B]
+        ratio_spgd[:, h] = (P_tx / P_opt).mean(1)
+        ratio_zero[h] = (bucket_power_batch(M, psi) / P_opt).mean()
+        if nn is not None:
+            f_idx = int(np.floor((t - trace['nn_latency']) / trace['t_frame'] + 1e-9))
+            ph_nn = full(nn[min(f_idx, len(nn) - 1)]) if f_idx >= 0 else np.zeros((B, L))
+            P_nn = bucket_power_batch(M, eps_tx * ph_nn + psi)
+            ratio_nn[h] = (P_nn / P_opt).mean()
+        if t >= cfg['t_burn']:
+            steady_spgd += P_tx / P_opt
+            if nn is not None:
+                steady_nn += P_nn / P_opt
+            n_steady += 1
+    n_steady = max(n_steady, 1)
+    return {'t': np.arange(n_half) * t_meas, 'gains': gains, 'dithers': dithers,
+            'ratio_spgd': ratio_spgd, 'ratio_nn': ratio_nn if nn is not None else None,
+            'ratio_zero': ratio_zero, 'steady_spgd': steady_spgd / n_steady,
+            'steady_nn': steady_nn / n_steady if nn is not None else None}
+
 ###  Code Beginning
 if __name__ == "__main__":
     print(f"Time to import: {Timer.elapsed()}")
     choice = input("""What test are you running?
-    -h5     -train data gpu     -training       -optsim 
-    -opt_diagnostics -bottleneck        -gpu_validate   -twin_check
-    -val_outliers           -nn_bucket_eval     -ckpt_check\n""")
+    -h5     -train data gpu     -training 
+    -twin_check   -val_outliers -time_eval
+    -nn_bucket_eval     -ckpt_check -photon_budget -spgd_eval\n""")
 
 #looking at testing data
 if choice == "h5":
@@ -1408,7 +1554,7 @@ if choice == "h5":
 
     print(f"index:          {example_num}")
     print(f"label (params): {list(map(lambda x: f'{x:.2e}', label))}")
-    print(f"fried_mult:     {row['fried_mult']}")
+    print(f"r500:     {row['r500']}")
     print(f"init_intensity: {row['init_intensity']:.2e}")
     print(f"best_intensity: {row['best_intensity']:.2e}")
     print(f"iterations:     {row['iterations']}")
@@ -1420,7 +1566,7 @@ if choice == "h5":
 #training CNN
 if choice == "training":
     # ---- run identity: CHANGE FOR EVERY NEW RUN ---------------------------
-    RUN_LABEL = 'training_twin_v4'
+    RUN_LABEL = 'training_div_v1'
     LOG_PATH  = f'outputs/train_logs/{RUN_LABEL}.csv'
     CKPT_DIR  = f'outputs/ckpts/{RUN_LABEL}'
  
@@ -1438,13 +1584,21 @@ if choice == "training":
     array = ArrayDesign(2, 'hex')
     center_idx = array.find_center_index()
     outer_positions = np.delete(array.arrayvector, center_idx, axis=0)
-    L = outer_positions.shape[0]
+    L = outer_positions.shape[0] 
     twin_perm = tf.constant(twin_permutation(outer_positions), tf.int32)
 
     # ---- data --------------------------------------------------------------
+    DATA_PATH = 'data/divtrainingdata.h5'
+    CROP = 512
     train_ds, val_ds, grid_size, norm_scale = DatasetStore.make_dataset(
-        'data/testtrainingdata.h5', batch_size=BATCH_SIZE
+        DATA_PATH, batch_size=BATCH_SIZE, crop=CROP
     )
+    norm_scale = np.atleast_1d(norm_scale)
+    C_IN = len(norm_scale)
+    USE_TWIN_LOSS = (C_IN == 1)
+    with h5py.File(DATA_PATH, 'r') as f:
+        stored_N = f['images'].shape[1]
+    SCALE = max(1, int(round(fringe_geometry(array, grid_N=stored_N, verbose=False)['fringe_nearest_px']/REF_FRINGE_PX)))
 
     steps_per_epoch = int(train_ds.cardinality().numpy())
     val_labels = np.concatenate([lab.numpy() for _, lab in val_ds], axis=0)
@@ -1466,11 +1620,12 @@ if choice == "training":
           f"zero-correction = {zero_baseline_deg:.2f}°")
  
     # ---- model + optimizers -----------------------------------------------
-    model = FFPhaseCNN(laser_count=L, element_positions=outer_positions)
-    print("SCALE = 4", "| zernike stride", model.zernike_conv.stride,
+    model = FFPhaseCNN(laser_count=L, element_positions=outer_positions, scale = SCALE)
+    print(f"input {grid_size}x{grid_size}x{C_IN} | loss: {'twin-invariant' if USE_TWIN_LOSS else 'direct'} |"
+      f"SCALE = {SCALE}", "| zernike stride", model.zernike_conv.stride,
       "| gabor stride", model.gabor_conv.stride,
       "| i_downsample first-conv stride", model.i_downsample.layers[1].strides)
-    model.build(input_shape=(1, grid_size, grid_size, 1))
+    model.build(input_shape=(1, grid_size, grid_size, C_IN))
     norm_vars, other_vars, all_vars, all_names, n_norm = build_variable_groups(model)
  
     total_steps = EPOCHS * steps_per_epoch
@@ -1482,12 +1637,14 @@ if choice == "training":
     optimizer_norm = tf.keras.optimizers.Adam(
         learning_rate=norm_lr, clipnorm=0.2, beta_1=0.9, beta_2=0.995, epsilon=1e-8
     )
- 
+    def phase_loss(labels, pred, reduce=True):
+        return (twin_invariant_loss(labels, pred, twin_perm, reduce=reduce)) if USE_TWIN_LOSS else direct_phase_loss(labels, pred, reduce=reduce)
+        
     @tf.function
     def train_step(images, labels):
         with tf.GradientTape() as tape:
             pred = model(images, training=True)
-            loss, eff = twin_invariant_loss(labels, pred, twin_perm)
+            loss, eff = phase_loss(labels, pred)
         grads = tape.gradient(loss, all_vars)
         optimizer_main.apply_gradients(zip(grads[n_norm:], other_vars))
         optimizer_norm.apply_gradients(zip(grads[:n_norm], norm_vars))
@@ -1500,21 +1657,21 @@ if choice == "training":
     def val_step(images, labels):
         """Returns SUMS so the ragged last val batch is weighted correctly."""
         pred = model(images, training=False)
-        l_min, eff = twin_invariant_loss(labels, pred, twin_perm, reduce=False)  # [B]
-        loss_sum = tf.reduce_sum(l_min) * L            # sum over samples AND lasers
+        l_min, eff = phase_loss(labels, pred, reduce=False)
         ang = predicted_angles(pred)
-        err_deg = tf.abs(tf.atan2(tf.sin(eff - ang), tf.cos(eff - ang))) * (180.0 / np.pi)
-        return loss_sum, tf.reduce_sum(err_deg, axis=0), tf.reduce_max(err_deg)
+        err = tf.abs(tf.atan2(tf.sin(eff-ang), tf.cos(eff-ang))) * (180.0 / np.pi)
+        _, eff_tw = twin_invariant_loss(labels, pred, twin_perm, reduce=False)
+        err_tw = tf.abs(tf.atan2(tf.sin(eff_tw-ang), tf.cos(eff_tw-ang))) * (180 / np.pi)
+        return tf.reduce_sum(l_min) * L, tf.reduce_sum(err, axis=0), tf.reduce_max(err), tf.reduce_sum(err_tw)
  
     def run_validation():
-        loss_sum, per_laser_sum, worst = 0.0, np.zeros(L), 0.0
+        loss_sum, per_laser_sum, worst, tw_sum = 0.0, np.zeros(L), 0.0, 0.0
         for images, labels in val_ds:
-            ls, pls, mx = val_step(images, labels)
-            loss_sum += float(ls)
-            per_laser_sum += pls.numpy()
-            worst = max(worst, float(mx))
+            ls, pls, mx, tws = val_step(images, labels)
+            loss_sum += float(ls); per_laser_sum += pls.numpy()
+            worst = max(worst, float(mx)); tw_sum += float(tws)
         per_laser = per_laser_sum / n_val
-        return loss_sum / (n_val * L), float(per_laser.mean()), worst, per_laser
+        return loss_sum / (n_val * L), float(per_laser.mean()), worst, per_laser, tw_sum / (n_val * L)
  
     # ---- logging -----------------------------------------------------------
     Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -1533,7 +1690,9 @@ if choice == "training":
             'steps_per_epoch': steps_per_epoch, 'n_val': n_val,
             'zero_correction_baseline_deg': zero_baseline_deg,
             # REQUIRED to run the trained model on any new data later:
-            'norm_scale': float(norm_scale),
+            'norm_scale': [float(v) for v in norm_scale],
+            'crop': CROP, 'input_channels': C_IN, 'scale': SCALE, 'data_path': DATA_PATH,
+            'twin_invariant_loss': USE_TWIN_LOSS,
         }, f, indent=2)
  
     csv_file = open(LOG_PATH, mode='w', newline='')
@@ -1583,7 +1742,7 @@ if choice == "training":
             model.save_weights(f'{CKPT_DIR}/best.weights.h5')
         else:
             epochs_since_best += 1
-        if epoch > 0 & epoch % CKPT_EVERY == 0:
+        if epoch > 0 and epoch % CKPT_EVERY == 0:
             model.save_weights(f'{CKPT_DIR}/epoch_{epoch:04d}.weights.h5')
  
         lr_m = float(main_lr(optimizer_main.iterations))
@@ -1614,262 +1773,6 @@ if choice == "training":
     print(f"done. best val mae: {best_val_mae:.2f}° "
           f"(zero-correction baseline {zero_baseline_deg:.2f}°) "
           f"-> {CKPT_DIR}/best.weights.h5")
-
-# optical simulator test 
-if choice == "optsim":
-    dist = np.float64(384000000)
-    target = [0, 0, dist]
-    john_array = ArrayDesign(2, 'square')
-    john_perturbation = BeamPerturbator(ssl = 16e-4, targ_pos = target, array_des = john_array, 
-                                        Ideal = True, fried_mult = 64.0, grid_length = 256)
-    x_in, y_in = john_perturbation.input_e_field_base()
-    john_perturbation.set_rel_phases()
-    e_field = john_perturbation.input_e_quick()
-    e_field_ff, x_out, y_out = john_perturbation.fresnel_propagation(e_field, dist)
-    I_field = np.abs(e_field) ** 2
-    I_field_ff = np.abs(e_field_ff) ** 2
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-    peak_idx = np.unravel_index(np.argmax(I_field_ff), I_field_ff.shape)
-    print(f"target = ({target[0]}, {target[1]}) m at z = {dist/1e3:.0f} km")
-    print(f"far-field peak at x={x_out[peak_idx[1]]:.3f} m, y={y_out[peak_idx[0]]:.3f} m")
- 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
- 
-    im1 = ax1.imshow(I_field, cmap='plasma', origin='lower',
-                      extent=[x_in.min(), x_in.max(), y_in.min(), y_in.max()], norm=LogNorm(vmin=I_field.max()*1e-4, vmax=I_field.max()))
-    ax1.set_title('Intensity at Apertures')
-    ax1.set_xlabel('x [m]')
-    ax1.set_ylabel('y [m]')
-    plt.colorbar(im1, ax=ax1)
- 
-    im2 = ax2.imshow(I_field_ff, cmap='plasma', origin='lower',
-                      extent=[x_out.min(), x_out.max(), y_out.min(), y_out.max()], norm=LogNorm(vmin=I_field_ff.max()*1e-4, vmax=I_field_ff.max()))
-    ax2.plot(target[0], target[1], '+', color='cyan', markersize=12, mew=2)
-    ax2.set_title('Intensity at Far Field')
-    ax2.set_xlabel('x [m]')
-    ax2.set_ylabel('y [m]')
-    plt.colorbar(im2, ax=ax2)
- 
-    plt.tight_layout()
-    out_dir = 'outputs'
-    os.makedirs(out_dir, exist_ok=True)  # FIX: no longer a hardcoded /workspace/ path
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    plt.savefig(f'{out_dir}/intensity_plots_{timestamp}.png', dpi=300, bbox_inches='tight')
-    plt.close(fig)
-
-if choice == "twin_check":
-    dist = np.float64(384000000)
-    target = [0, 0, dist]
-    array = ArrayDesign(2, 'hex')
-    perm = twin_permutation(array.arrayvector)
-    sim = BeamPerturbator(ssl=16e-4, targ_pos=target, array_des=array,
-                          Ideal=True, grid_length=256)
-    sim.input_e_field_base()
-    c = sim.center_idx
-    rng = np.random.default_rng(0)
-    wrap = lambda v: np.angle(np.exp(1j * v))
- 
-    def far_image(phases):
-        sim.set_rel_phases(phases)
-        E, _, _ = sim.fresnel_propagation(sim.input_e_quick(), dist)
-        return np.abs(E) ** 2
- 
-    for t in range(5):
-        phi = wrap(rng.uniform(-np.pi, np.pi, len(perm)))
-        phi = wrap(phi - phi[c])                       # center-referenced, like labels
-        other = wrap(rng.uniform(-np.pi, np.pi, len(perm)))
-        other = wrap(other - other[c])
-        I, I_tw, I_oth = far_image(phi), far_image(-phi[perm]), far_image(other)
-        rel = lambda A, B: np.linalg.norm(A - B) / np.linalg.norm(A)
-        lab = np.degrees(np.abs(wrap(phi + phi[perm]))).mean()
-        print(f"trial {t}: |I - I_twin|/|I| = {rel(I, I_tw):.1e}   "
-              f"|I - I_random|/|I| = {rel(I, I_oth):.1e}   "
-              f"label distance phi vs twin = {lab:.1f} deg")
-    sim.set_rel_phases()
-
-if choice == "data_audit":
-    H5 = Path('data/testtrainingdata.h5')       # same file the training branch uses
-    VAL_SPLIT, CLIP_PCT = 0.1, 99.999            # make_dataset defaults
-    MAX_SIDE = 64                                # downsampled side length for kNN
-    wrap = lambda v: np.angle(np.exp(1j * v))
- 
-    array = ArrayDesign(2, 'hex')
-    outer_positions = np.delete(array.arrayvector, array.find_center_index(), axis=0)
-    perm = twin_permutation(outer_positions)
-    L = len(perm)
- 
-    # --- identical split / norm_scale to make_dataset ---
-    # Row count: catalog if present, otherwise the last row with a non-zero label.
-    # (DatasetStore grows the file by doubling, so trailing rows are zero padding.)
-    with h5py.File(H5, 'r') as f:
-        all_labels = f['labels'][:]
-        n_rows = f['images'].shape[0]
-    nz = np.flatnonzero(np.any(all_labels != 0, axis=1))
-    n_written = int(nz[-1]) + 1 if len(nz) else 0
-    cat_path = H5.with_suffix('.catalog.csv')
-    n_total = len(pd.read_csv(cat_path)) if cat_path.exists() else n_written
-    print(f"rows in h5: {n_rows} | rows with data: {n_written} | "
-          f"catalog: {'found' if cat_path.exists() else 'MISSING'} -> using {n_total}")
-    if n_rows > n_written:
-        print(f"WARNING: {n_rows - n_written} zero-padded rows. Without the catalog, "
-              f"make_dataset trains on them as real examples (blank image, label 0).")
-    indices = np.arange(n_total)
-    np.random.default_rng(42).shuffle(indices)
-    n_val = int(n_total * VAL_SPLIT)
-    val_idx, train_idx = indices[:n_val], indices[n_val:]
-    with h5py.File(H5, 'r') as f:
-        sample_idx = np.sort(np.random.default_rng(42).choice(
-            train_idx, min(100, len(train_idx)), replace=False))
-        norm_scale = np.percentile(f['images'][sample_idx], CLIP_PCT)
-        grid = f['images'].shape[1]
-    val_idx, train_idx = np.sort(val_idx), np.sort(train_idx)
- 
-    def twin_err_deg(pred, lab):
-        """Per-sample MAE, branch chosen by the 1-cos loss -- same rule as training."""
-        tw = -lab[:, perm]
-        l1 = (1 - np.cos(lab - pred)).mean(1)
-        l2 = (1 - np.cos(tw - pred)).mean(1)
-        eff = np.where((l2 < l1)[:, None], tw, lab)
-        return np.degrees(np.abs(wrap(eff - pred))).mean(1)
- 
-    def load(idx, f_down):
-        """Labels + preprocessed, block-averaged images (same preprocess as training)."""
-        feats, labs = [], []
-        with h5py.File(H5, 'r') as f:
-            labs = f['labels'][idx].astype(np.float64)
-            for s in range(0, len(idx), 64):
-                imgs = f['images'][idx[s:s + 64]].astype(np.float32)
-                imgs = np.log1p(np.clip(imgs, 0, norm_scale) / norm_scale * 1000.0)
-                h = grid // f_down * f_down
-                imgs = imgs[:, :h, :h].reshape(len(imgs), h // f_down, f_down,
-                                               h // f_down, f_down).mean((2, 4))
-                feats.append(imgs.reshape(len(imgs), -1))
-        return np.concatenate(feats), labs
- 
-    f_down = max(1, grid // MAX_SIDE)
-    Xtr, Ytr = load(train_idx, f_down)
-    Xva, Yva = load(val_idx, f_down)
-    print(f"{len(Ytr)} train / {len(Yva)} val, grid {grid} -> {Xtr.shape[1]} features")
- 
-    # --- label statistics ---
-    R = np.abs(np.exp(1j * Ytr).mean(0))
-    circ_std = np.degrees(np.sqrt(-2 * np.log(np.clip(R, 1e-12, 1))))
-    print("per-laser circular std (deg):", np.round(circ_std, 1))
- 
-    # --- baselines under the twin-invariant metric ---
-    zero_mae = twin_err_deg(np.zeros_like(Yva), Yva).mean()
-    best_c, best_score = None, np.inf
-    rng = np.random.default_rng(0)
-    for r in range(8):                       # k-means-style fit of the best constant
-        c = np.angle(np.exp(1j * Ytr).mean(0)) if r == 0 else rng.uniform(-np.pi, np.pi, L)
-        for _ in range(50):
-            tw = -Ytr[:, perm]
-            use_tw = (1 - np.cos(tw - c)).mean(1) < (1 - np.cos(Ytr - c)).mean(1)
-            c = np.angle(np.exp(1j * np.where(use_tw[:, None], tw, Ytr)).mean(0))
-        score = twin_err_deg(np.broadcast_to(c, Ytr.shape), Ytr).mean()
-        if score < best_score:
-            best_c, best_score = c, score
-    const_val = twin_err_deg(np.broadcast_to(best_c, Yva.shape), Yva)
-    print(f"zero-correction  (twin-aware) val MAE: {zero_mae:.2f}°")
-    print(f"best constant    (twin-aware) val MAE: {const_val.mean():.2f}°  "
-          f"per-laser-ish reference for your 69.5°")
- 
-    # --- kNN in image space ---
-    d2 = ((Xva ** 2).sum(1)[:, None] + (Xtr ** 2).sum(1)[None, :]
-          - 2 * Xva @ Xtr.T)
-    order = np.argsort(d2, axis=1)
-    for k in (1, 5, 20):
-        preds = np.empty_like(Yva)
-        for i in range(len(Yva)):
-            nb = Ytr[order[i, :k]]
-            ref, aligned = nb[0], [nb[0]]
-            for v in nb[1:]:                      # put neighbours on the same twin branch
-                tw = -v[perm]
-                aligned.append(v if (1 - np.cos(v - ref)).mean() <= (1 - np.cos(tw - ref)).mean() else tw)
-            preds[i] = np.angle(np.exp(1j * np.array(aligned)).mean(0))
-        print(f"kNN k={k:2d}       (twin-aware) val MAE: {twin_err_deg(preds, Yva).mean():.2f}°")
- 
-    # --- does the optimizer actually buy much? ---
-    if cat_path.exists():
-        cat = pd.read_csv(cat_path)
-        gain = cat['best_intensity'] / cat['init_intensity']
-        print(f"bucket gain best/init: median {gain.median():.2f}, "
-              f"10–90%: {gain.quantile(0.1):.2f}–{gain.quantile(0.9):.2f}")
-    else:
-        print("bucket gain: skipped (no catalog)")
- 
- 
-# ----------------------------------------------------------------------------
-# B) turb_regime: is the turbulence acting like a per-element piston (learnable
-#    phasing problem) or is each beam already speckle? Also checks the phase-
-#    screen pixel-scale mismatch and FFT wrap-around. Enter the SAME grid size,
-#    sampling and fried_mult you generated the dataset with.
-# ----------------------------------------------------------------------------
-if choice == "turb_regime":
-    grid_data_size = int(input("Grid size used for the dataset?\n"))
-    grid_ssl = int(input("Sampling used for the dataset (0.1mm)?\n"))
-    fried_m = float(input("fried_mult used for the dataset?\n"))
-    n_real = int(input("How many realizations?\n"))
-    dist = 384000000
-    target = [0, 0, dist]
-    array = ArrayDesign(2, 'hex')
-    ssl = grid_ssl * 1e-4
- 
-    ideal = BeamPerturbator(ssl=ssl, targ_pos=target, array_des=array, Ideal=True,
-                            grid_length=grid_data_size)
-    ideal.input_e_field_base()
-    sim = BeamPerturbator(ssl=ssl, targ_pos=target, array_des=array, Ideal=False,
-                          fried_mult=fried_m, grid_length=grid_data_size)
-    sim.input_e_field_base()
- 
-    # --- r0 and the screen pixel-scale mismatch ---
-    tm = sim.turb_model
-    h = np.linspace(0, 20000, 17)                      # all_screen_gen's slabs
-    r0 = sum(tm.hv_fried_param(h[i], h[i + 1], 1) ** (-5 / 3) for i in range(16)) ** (-3 / 5)
-    r0_eff = r0 * ssl / tm.pixel_scale                # screens are applied on the ssl grid
-    print(f"field grid: {grid_data_size} x {ssl*1e3:.2f} mm = {grid_data_size*ssl:.3f} m")
-    print(f"screen pixel scale: {tm.pixel_scale*1e3:.2f} mm (built for a 2.0 m screen)")
-    print(f"r0 as generated: {r0*100:.1f} cm   r0 as actually applied: {r0_eff*100:.1f} cm   "
-          f"aperture D = {2*sim.apert_radi*100:.0f} cm  ->  D/r0_eff = {2*sim.apert_radi/r0_eff:.2f}")
- 
-    # Reference = the SAME atmosphere code path with all screens zeroed (vacuum).
-    # (The previous version compared against the direct ideal propagation, which
-    # differs by a common far-field phase -> residual ~1 even when nothing is wrong.)
-    G = [ideal.fresnel_propagation(b, dist)[0] for b in ideal.base_fields]
-    saved_screens = sim.phase_screens
-    sim.phase_screens = np.zeros_like(saved_screens)
-    F0 = [sim.fresnel_propagation(b, dist)[0] for b in sim.base_fields]
-    sim.phase_screens = saved_screens
-    nrm = lambda I: I / I.sum()
-    I_dir, I_path = nrm(np.abs(sum(G)) ** 2), nrm(np.abs(sum(F0)) ** 2)
-    print(f"NUMERICS (no turbulence): zero-phase image, atmosphere path vs direct "
-          f"propagation: rel diff {np.linalg.norm(I_path - I_dir) / np.linalg.norm(I_dir):.3f}"
-          f"   (should be ~0.001)")
- 
-    for r in range(n_real):
-        if r:
-            sim.generate_turbulence()
-        # wrap-around: power in the outer 10% border at the top of the atmosphere
-        field = sim.input_e_quick()
-        for n in range(len(sim.h_layers)):             # mirrors fresnel_propagation
-            field = ifft2(fft2(field) * sim.h_layers[n])
-            field *= np.exp(1j * sim.phase_screens[n])
-        P = np.abs(field) ** 2
-        b = max(1, grid_data_size // 10)
-        edge_frac = 1 - P[b:-b, b:-b].sum() / P.sum()
- 
-        resid, strehl = [], []
-        for n, base in enumerate(sim.base_fields):
-            F = sim.fresnel_propagation(base, dist)[0]
-            a = np.vdot(F0[n], F) / np.vdot(F0[n], F0[n])     # best piston+amplitude fit
-            resid.append(np.linalg.norm(F - a * F0[n]) / np.linalg.norm(F))
-            strehl.append(np.abs(F).max() ** 2 / np.abs(F0[n]).max() ** 2)
-        print(f"realization {r}: border power {edge_frac:.3f} | "
-              f"piston-model residual {np.round(resid, 2)} | "
-              f"peak ratio vs vacuum {np.round(strehl, 2)}")
-    print("residual << 1 -> each beam is a clean spot with a phase: a phasing problem.\n"
-          "residual ~ 1  -> each beam is already speckle at the target.")
     
 if choice == "train data gpu":
     grid_data_size = int(input("How long should the grid be?\n"))
@@ -1877,18 +1780,21 @@ if choice == "train data gpu":
     real_count = int(input("How many realizations do you want to generate?\n"))
     batch = int(input("Realizations per GPU batch? (4 is a safe start)\n"))
     seed = int(input("Random seed? (use a new one for each extra chunk of data)\n"))
-    fried_m = 0.424
-    out_path = 'data/testtrainingdata.h5'
+    r500 = 0.05
+    out_path = 'data/divtrainingdata.h5'
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     array = ArrayDesign(2, 'hex')
     dist = 384000000
     target = [0, 0, dist]
     sim = BeamPerturbator(ssl=grid_ssl * 1e-4, targ_pos=target, array_des=array,
-                          fried_mult=fried_m, Ideal=False, grid_length=grid_data_size)
+                          Ideal=False, grid_length=grid_data_size)
     sim.input_e_field_base()
     gen = GPUDataGenerator(sim, seed=seed)
     writer = DatasetStore(out_path, image_shape=(grid_data_size, grid_data_size),
-                          num_channels=array.arrayvector.shape[0] - 1, flush_count=16)
+                          num_channels=array.arrayvector.shape[0] - 1, flush_count=16,
+                          with_diversity=True)
+    div_ph = diversity_phases(sim.element_positions)
+    print(f"diversity image: +{np.degrees(diversity_delta):.0f} deg on elements {np.flatnonzero(div_ph).tolist()}")
     print(f"r0 per slab (cm): {np.round(gen.r0 * 100, 1)}")
     print(f"total r0: {(gen.r0 ** (-5/3)).sum() ** (-3/5) * 100:.1f} cm | "
           f"existing examples in file: {writer._n}")
@@ -1896,11 +1802,11 @@ if choice == "train data gpu":
     t0 = Timer.elapsed()
     while done < real_count:
         B = min(batch, real_count - done)
-        results, _ = gen.run_batch(B)
+        results, _ = gen.run_batch(B, div_phases=div_ph)
         for r in results:
             outer_params = np.delete(r['best_params'], gen.center_idx)
             writer.add_example(r['init_image'].astype('float32'), r['opt_image'].astype('float32'),
-                               outer_params.astype('float32'), fried_mult=fried_m,
+                               outer_params.astype('float32'), div_image=r['div_image'].astype('float32'), r500=r500, div_delta=float(diversity_delta),
                                init_intensity=r['init_intensity'], best_intensity=r['best_intensity'],
                                iterations=r['iterations'], target_x=target[0], target_y=target[1])
         done += B
@@ -1908,213 +1814,11 @@ if choice == "train data gpu":
         print(f"{done}/{real_count} realizations | {el / done:.2f} s each | "
               f"ETA {(real_count - done) * el / done / 60:.1f} min", flush=True)
     writer.close()
- 
- 
-# ----------------------------------------------------------------------------
-# Branch: check the GPU pipeline against the CPU simulator before trusting it
-# ----------------------------------------------------------------------------
-if choice == "gpu_validate":
-    grid_data_size = int(input("Grid size?\n"))
-    grid_ssl = int(input("Sampling (0.1mm)?\n"))
-    array = ArrayDesign(2, 'hex')
-    dist = 384000000
-    sim = BeamPerturbator(ssl=grid_ssl * 1e-4, targ_pos=[0, 0, dist], array_des=array,
-                          fried_mult=1, Ideal=False, grid_length=grid_data_size)
-    sim.input_e_field_base()
-    gen = GPUDataGenerator(sim, seed=123)
-    N, d = grid_data_size, sim.turb_model.pixel_scale
- 
-    # (1) screen statistics vs soapy, at the strongest slab's r0
-    r0_test = float(gen.r0.min())
-    seps = [1, 2, 4, 8, 16, 32, 64, 128]
-    def struct_fn(scrs):    # per-screen structure function, [n_screens, n_seps]
-        return np.array([[np.mean((s[:, j:] - s[:, :-j]) ** 2) for j in seps] for s in scrs])
-    n_s = 64                # 12 is too few: one screen's strength varies ~14% even at 1 px
-    soapy_s = [soapy.atmosphere.makePhaseScreens(1, r0_test, N, d, np.inf, 0.01, True, SH=True)[0]
-               for _ in range(n_s)]
-    flat_r0 = tf.constant(np.full(gen.S, r0_test ** (-5 / 6), np.float32))
-    gpu_s = np.concatenate([gen.generate_screens(tf.constant(1), flat_r0).numpy()[0]
-                            for _ in range(-(-n_s // gen.S))])[:n_s]
-    Ds, Dg = struct_fn(soapy_s), struct_fn(gpu_s)
-    theory = 6.88 * (np.array(seps) * d / r0_test) ** (5 / 3)
-    print(f"r0 = {r0_test*100:.1f} cm, {n_s} screens each")
-    print("separation(px)  D_soapy        D_gpu          gpu/soapy  z-score  soapy/Kolmogorov")
-    for k, (j, t) in enumerate(zip(seps, theory)):
-        ma, sa = Ds[:, k].mean(), Ds[:, k].std() / np.sqrt(n_s)
-        mb, sb = Dg[:, k].mean(), Dg[:, k].std() / np.sqrt(n_s)
-        print(f"{j:8d}      {ma:.4f}±{sa:.4f}  {mb:.4f}±{sb:.4f}   {mb / ma:6.3f}   {(mb - ma) / np.hypot(sa, sb):+5.2f}"
-              f"     {ma / t:6.2f}")
-    print("|z| < 2 at every separation -> statistically indistinguishable from soapy.")
- 
-    # (2) propagation + labels vs the CPU code on identical screens
-    results, screens = gen.run_batch(1)
-    sim.phase_screens = screens.numpy()[0].astype(np.float64)
-    best_cpu, _, n_cpu, mask = sim.compute_optimal_phases(100)
-    sim.set_rel_phases()
-    E0, _, _ = sim.fresnel_propagation(sim.input_e_quick(), dist)
-    sim.set_rel_phases(best_cpu)
-    E1, _, _ = sim.fresnel_propagation(sim.input_e_quick(), dist)
-    sim.set_rel_phases()
-    I0, I1 = np.abs(E0) ** 2, np.abs(E1) ** 2
-    r = results[0]
-    rel = lambda A, B_: np.linalg.norm(A - B_) / np.linalg.norm(B_)
-    dphi = np.degrees(np.abs(np.angle(np.exp(1j * (r['best_params'] - best_cpu)))))
-    print(f"init image rel diff GPU vs CPU: {rel(r['init_image'], I0):.1e}")
-    print(f"opt  image rel diff GPU vs CPU: {rel(r['opt_image'], I1):.1e}")
-    print(f"label max diff: {dphi.max():.3f} deg   iterations GPU/CPU: {r['iterations']}/{n_cpu}")
-    print(f"bucket mask identical: {np.array_equal(mask, gen.mask)}")
-
-if choice == "screen_spectrum_check":
-    grid_data_size = int(input("Grid size?\n"))
-    grid_ssl = int(input("Sampling (0.1mm)?\n"))
-    n_s = int(input("Screens per test? (64 recommended)\n"))
-    array = ArrayDesign(2, 'hex')
-    sim = BeamPerturbator(ssl=grid_ssl * 1e-4, targ_pos=[0, 0, 384000000], array_des=array,
-                          fried_mult=1, Ideal=False, grid_length=grid_data_size)
-    sim.input_e_field_base()
-    N, d = grid_data_size, sim.turb_model.pixel_scale
-    seed = int(np.random.SeedSequence().entropy % 2 ** 31)
- 
-    # 0) the random-number generator itself, on this device
-    g = tf.random.Generator.from_seed(seed).normal([64, N, N]).numpy().astype(np.float64)
-    print(f"device: {tf.config.list_logical_devices('GPU') or 'CPU only'}")
-    print(f"tf normal draws: mean {g.mean():+.5f}  var {g.var():.5f}  (expect 0, 1)")
-    del g
- 
-    # Two generators: one with subharmonics switched off, one with the FFT part off.
-    # (Constants are captured when generate_screens is first traced, so set them first.)
-    gen_hi = GPUDataGenerator(sim, seed=seed)
-    gen_hi.amp_lo = tf.zeros_like(gen_hi.amp_lo)
-    gen_lo = GPUDataGenerator(sim, seed=seed + 1)
-    gen_lo.amp_hi = tf.zeros_like(gen_lo.amp_hi)
-    r0_test = float(gen_hi.r0.min())
-    flat_r0 = tf.constant(np.full(gen_hi.S, r0_test ** (-5 / 6), np.float32))
- 
-    def gpu_screens(gen):
-        reps = -(-n_s // gen.S)
-        return np.concatenate([gen.generate_screens(tf.constant(1), flat_r0).numpy()[0]
-                               for _ in range(reps)])[:n_s].astype(np.float64)
- 
-    # ---------------- (A) high-frequency part ----------------
-    del_f = 1.0 / (N * d)
-    fx = np.arange(-N / 2, N / 2) * del_f
-    FX, FY = np.meshgrid(fx, fx)
-    f = np.hypot(FX, FY)
-    fm = 5.92 / 0.01 / (2 * np.pi)
-    with np.errstate(divide='ignore'):
-        psd = 0.023 * r0_test ** (-5 / 3) * np.exp(-(f / fm) ** 2) / f ** (11 / 3)
-    psd[N // 2, N // 2] = 0
-    expected = psd * del_f ** 2
-    k_idx = np.arange(-N // 2, N // 2)
-    k_r = np.hypot(*np.meshgrid(k_idx, k_idx))
-    edges = [e for e in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512] if e <= N // 2]
-    bands = [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
-    band_masks = [(k_r >= a) & (k_r < b) for a, b in bands]
- 
-    def spectral_ratios(screens):
-        per = np.array([[ (np.abs(np.fft.fftshift(np.fft.fft2(s))) ** 2 / N ** 4)[m].sum()
-                          / expected[m].sum() for m in band_masks] for s in screens])
-        return per.mean(0), per.std(0) / np.sqrt(len(screens))
- 
-    gpu_hi = gpu_screens(gen_hi)
-    soapy_hi = [soapy.atmosphere.phasescreen.ft_phase_screen(r0_test, N, d, np.inf, 0.01)
-                for _ in range(n_s)]
-    mg, sg = spectral_ratios(gpu_hi)
-    ms, ss = spectral_ratios(soapy_hi)
-    print(f"\n(A) FFT part, r0 = {r0_test*100:.1f} cm, {n_s} screens each. measured/expected power")
-    print("|k| band (FFT index)    GPU               soapy")
-    for (a, b), m1, s1, m2, s2 in zip(bands, mg, sg, ms, ss):
-        print(f"   [{a:3d},{b:3d})          {m1:.3f} ± {s1:.3f}     {m2:.3f} ± {s2:.3f}")
- 
-    # ---------------- (B) subharmonic part ----------------
-    coords = np.arange(-N / 2, N / 2) * d
-    D = N * d
-    exp_var = 0.0
-    for p in range(1, 4):
-        dfp = 1 / (3 ** p * D)
-        f3 = np.arange(-1, 2) * dfp
-        F3x, F3y = np.meshgrid(f3, f3)
-        f3r = np.hypot(F3x, F3y)
-        with np.errstate(divide='ignore'):
-            psd3 = 0.023 * r0_test ** (-5 / 3) * np.exp(-(f3r / fm) ** 2) / f3r ** (11 / 3)
-        psd3[1, 1] = 0
-        amp2 = psd3 * dfp ** 2
-        m1d = np.exp(1j * 2 * np.pi * f3[:, None] * coords[None, :]).mean(1)    # <e^{i 2pi f x}>
-        m2d = np.abs(m1d[:, None] * m1d[None, :]) ** 2                         # [i (y), j (x)]
-        exp_var += np.sum(amp2 * (1 - m2d))
-    gpu_lo = gpu_screens(gen_lo)
-    v = np.array([s.var() for s in gpu_lo])
-    print(f"\n(B) subharmonic part, {n_s} screens. spatial variance (rad^2)")
-    print(f"   GPU {v.mean():.4f} ± {v.std() / np.sqrt(n_s):.4f}   expected {exp_var:.4f}   "
-          f"ratio {v.mean() / exp_var:.3f} ± {v.std() / np.sqrt(n_s) / exp_var:.3f}")
-    try:   # soapy's own subharmonic part = SH screen - FFT screen drawn with the same seed
-        vs = []
-        for i in range(min(n_s, 32)):
-            sd = seed + 1000 + i
-            sh = soapy.atmosphere.phasescreen.ft_sh_phase_screen(r0_test, N, d, np.inf, 0.01, seed=sd)
-            hi = soapy.atmosphere.phasescreen.ft_phase_screen(r0_test, N, d, np.inf, 0.01, seed=sd)
-            vs.append((sh - hi).var())
-        vs = np.array(vs)
-        print(f"   soapy {vs.mean():.4f} ± {vs.std() / np.sqrt(len(vs)):.4f}   "
-              f"ratio {vs.mean() / exp_var:.3f} ± {vs.std() / np.sqrt(len(vs)) / exp_var:.3f}  "
-              f"({len(vs)} screens)")
-    except TypeError:
-        print("   (this soapy version has no seed argument; soapy subharmonic row skipped)")
-    print("\nEvery ratio should be 1.00 within about 2 standard errors.")
-
-if choice == "screen_exact_check":
-    grid_data_size = int(input("Grid size?\n"))
-    grid_ssl = int(input("Sampling (0.1mm)?\n"))
-    from soapy.atmosphere import phasescreen as soapy_ps
-    array = ArrayDesign(2, 'hex')
-    sim = BeamPerturbator(ssl=grid_ssl * 1e-4, targ_pos=[0, 0, 384000000], array_des=array,
-                          fried_mult=1, Ideal=False, grid_length=grid_data_size)
-    sim.input_e_field_base()
-    N, d = grid_data_size, sim.turb_model.pixel_scale
-    seed = 999
-    gen = GPUDataGenerator(sim, seed=seed)
-    r0_test = float(gen.r0.min())
-    flat_r0 = tf.constant(np.full(gen.S, r0_test ** (-5 / 6), np.float32))
- 
-    # an identical generator, called with the same shapes in the same order,
-    # yields the same numbers generate_screens will draw
-    rec = tf.random.Generator.from_seed(seed)
-    draws = []
-    for n in range(gen.S):
-        hi = rec.normal([1, 2, N, N]).numpy()[0]
-        lo = [rec.normal([1, 2, 3, 3]).numpy()[0] for _ in range(3)]
-        draws.append((hi, lo))
-    gpu = gen.generate_screens(tf.constant(1), flat_r0).numpy()[0]
- 
-    class _FixedDraws:
-        """Stands in for numpy's Generator: returns pre-recorded normals in order."""
-        def __init__(self, seq):
-            self.seq = list(seq)
-        def normal(self, size=None):
-            return np.asarray(self.seq.pop(0), dtype=np.float64).reshape(size)
- 
-    real_default_rng = np.random.default_rng
-    errs = []
-    for n, (hi, lo) in enumerate(draws):
-        sh_draws = [x for p in range(3) for x in (lo[p][0], lo[p][1])]   # real, imag per level
-        # ft_sh_phase_screen creates its generator first, then ft_phase_screen creates one
-        queue = [_FixedDraws(sh_draws), _FixedDraws([hi[0], hi[1]])]
-        np.random.default_rng = lambda seed=None: queue.pop(0)
-        try:
-            ref = soapy_ps.ft_sh_phase_screen(r0_test, N, d, np.inf, 0.01)
-        finally:
-            np.random.default_rng = real_default_rng
-        errs.append(np.linalg.norm(gpu[n] - ref) / np.linalg.norm(ref))
-    print(f"device: {tf.config.list_logical_devices('GPU') or 'CPU only'}")
-    print("GPU screen vs aotools ft_sh_phase_screen on identical random numbers "
-          "(relative difference per screen):")
-    print(np.array(errs))
-    print("Expect ~1e-6 everywhere (float32 rounding).")
 
 if choice == "val_outliers":
     run_label = input("Run label to analyse (e.g. training_twin_v4)?\n").strip()
     K = int(input("How many worst examples to plot? (20 recommended)\n") or 20)
-    H5 = Path('data/testtrainingdata.h5')
+    H5 = Path(read_run_config(run_label).get('data_path', 'data/testtrainingdata.h5'))
     VAL_SPLIT = 0.1                                           # make_dataset default
     wrap = lambda v: np.angle(np.exp(1j * v))
  
@@ -2144,7 +1848,9 @@ if choice == "val_outliers":
             idx = val_idx[s:s + 32]
             imgs = f['images'][idx].astype(np.float32)
             labels.append(f['labels'][idx].astype(np.float64))
-            preds.append(predict_outer_phases(model, imgs, norm_scale, crop))
+            net_in = (np.stack([imgs, f['div_images'][idx].astype(np.float32)], axis=-1)
+                      if len(norm_scale) == 2 else imgs)
+            preds.append(predict_outer_phases(model, net_in, norm_scale, crop))
             for I in imgs:
                 tot = I.sum()
                 cy, cx = (I * yy).sum() / tot, (I * xx).sum() / tot
@@ -2156,8 +1862,14 @@ if choice == "val_outliers":
             print(f"  {min(s + 32, len(val_idx))}/{len(val_idx)}", end='\r', flush=True)
     preds, labels = np.concatenate(preds), np.concatenate(labels)
     cmp_ = twin_aware_compare(preds, labels, perm)
+    if len(norm_scale) == 2:      # diversity model: scored against the true labels, no twin branch
+        err_direct = np.degrees(np.abs(wrap(labels - preds)))
+        print(f"\nval MAE (direct, should match the log's best): {err_direct.mean():.2f}°   "
+              f"twin-aware: {cmp_['err_deg'].mean():.2f}°")
+        cmp_['err_deg'], cmp_['eff'] = err_direct, labels
+    else:
+        print(f"\nval MAE (twin-aware, should match the log's best): {cmp_['err_deg'].mean():.2f}°")
     mae = cmp_['err_deg'].mean(1)
-    print(f"\nval MAE (twin-aware, should match the log's best): {mae.mean():.2f}°")
  
     # assemble per-sample table
     df = pd.DataFrame(diag)
@@ -2224,16 +1936,12 @@ if choice == "val_outliers":
     plt.savefig(out_dir / f'worst_{K}.png', dpi=120)
     plt.close(fig)
     print(f"worst-{K} figure: {out_dir / f'worst_{K}.png'}")
- 
- 
-# ----------------------------------------------------------------------------
-# Branch 2: bucket power delivered by the network on fresh realizations
-# ----------------------------------------------------------------------------
+
 if choice == "nn_bucket_eval":
     run_label = input("Run label to evaluate (e.g. training_twin_v4)?\n").strip()
     grid_N = int(input("Grid size used for the training data? (1024)\n") or 1024)
     grid_ssl = int(input("Sampling used for the training data (0.1mm)? (20)\n") or 20)
-    fried_m = float(input("fried_mult used for the training data? (0.424)\n") or 0.424)
+    r500 = float(input("r500 used for the training data? (0.05m)\n") or 0.05)
     n_real = int(input("How many fresh realizations? (500 recommended)\n") or 500)
     batch = int(input("Realizations per GPU batch? (4)\n") or 4)
     seed = int(input("Random seed (use one never used for training data)?\n"))
@@ -2241,7 +1949,7 @@ if choice == "nn_bucket_eval":
     array = ArrayDesign(2, 'hex')
     dist = 384000000
     sim = BeamPerturbator(ssl=grid_ssl * 1e-4, targ_pos=[0, 0, dist], array_des=array,
-                          fried_mult=fried_m, Ideal=False, grid_length=grid_N)
+                          r500=r500, Ideal=False, grid_length=grid_N)
     sim.input_e_field_base()
     gen = GPUDataGenerator(sim, seed=seed)
     model, norm_scale, outer_positions, center_idx, crop = load_trained_model(run_label, grid_N, array)
@@ -2267,7 +1975,12 @@ if choice == "nn_bucket_eval":
         F, M = gen.far_fields(screens)
         M = M.numpy().astype(np.complex128)
         init_imgs = gen.images(F, tf.zeros([B, gen.L], tf.float32)).numpy()
-        pred = predict_outer_phases(model, init_imgs, norm_scale, crop)
+        if len(norm_scale) == 2:      # diversity model: also record the diversity image
+            div = tf.tile(tf.constant(diversity_phases(sim.element_positions)[None]), [B, 1])
+            net_in = np.stack([init_imgs, gen.images(F, div).numpy()], axis=-1)
+        else:
+            net_in = init_imgs
+        pred = predict_outer_phases(model, net_in, norm_scale, crop)
         for b in range(B):
             Mb = 0.5 * (M[b] + M[b].conj().T)
             opt, P_opt, _ = optimal_phases_from_M(Mb, 100, center_idx)
@@ -2286,12 +1999,15 @@ if choice == "nn_bucket_eval":
     preds = np.array([r['pred'] for r in rows])
     cmp_ = twin_aware_compare(preds, labels, perm)
     mae = cmp_['err_deg'].mean(1)
+    wrap = lambda v: np.angle(np.exp(1j * v))
+    mae_direct = np.degrees(np.abs(wrap(labels - preds))).mean(1)
  
     def show(name, ratio):
         q = np.percentile(ratio, [5, 25, 50, 75, 95])
         print(f"  {name:38s} mean {ratio.mean():.3f}  median {q[2]:.3f}   5–95%: {q[0]:.3f}–{q[4]:.3f}")
  
-    print(f"\n{n_real} fresh realizations   (twin-aware MAE on them: {mae.mean():.2f}°)")
+    print(f"\n{n_real} fresh realizations   (MAE on them: direct {mae_direct.mean():.2f}°, "
+          f"twin-aware {mae.mean():.2f}°)")
     print("bucket power relative to the optimizer's optimum:")
     show("no correction (all phases 0)", P['P_zero'] / P['P_opt'])
     show("NN prediction as output", P['P_nn'] / P['P_opt'])
@@ -2330,7 +2046,8 @@ if choice == "ckpt_check":
     run_label = input("Run label (e.g. training_twin_v4)?\n").strip()
     n_check = int(input("Validation samples to evaluate per checkpoint? (200)\n") or 200)
     extra = input("Epoch checkpoints to also test, comma-separated (e.g. 172,448), or blank:\n").strip()
-    H5 = Path('data/testtrainingdata.h5')
+    cfg = json.load(open(f'outputs/train_logs/{run_label}_config.json'))
+    H5 = Path(cfg.get('data_path', 'data/testtrainingdata.h5'))
     ck_dir = Path(f'outputs/ckpts/{run_label}')
     cfg_p = Path(f'outputs/train_logs/{run_label}_config.json')
     log_p = Path(f'outputs/train_logs/{run_label}.csv')
@@ -2340,7 +2057,6 @@ if choice == "ckpt_check":
     print("---- (1) files ----")
     for p in (ck_dir / 'best.weights.h5', cfg_p, log_p, H5, H5.with_suffix('.catalog.csv')):
         print(f"  {str(p):55s} modified {ts(p)}")
-    cfg = json.load(open(cfg_p))
     print(f"  config: epochs {cfg.get('epochs')}, n_val {cfg.get('n_val')}, "
           f"steps/epoch {cfg.get('steps_per_epoch')}, norm_scale {cfg.get('norm_scale')}")
     if log_p.exists():
@@ -2363,12 +2079,14 @@ if choice == "ckpt_check":
         s_idx = np.sort(np.random.default_rng(42).choice(train_idx, min(100, len(train_idx)), replace=False))
         crop_cfg = cfg.get('crop', 512)
         crop_cfg = None if (crop_cfg is None or crop_cfg >= grid_N) else int(crop_cfg)
-        ns_now = float(np.percentile(center_crop(f['images'][s_idx], crop_cfg), 99.999))
+        chans = ['images'] + (['div_images'] if len(np.atleast_1d(cfg['norm_scale'])) == 2 else [])
+        ns_now = [float(np.percentile(center_crop(f[c][s_idx], crop_cfg), 99.999)) for c in chans]
         sel = val_idx[:n_check]
-        imgs = f['images'][sel].astype(np.float32)
+        imgs = np.stack([f[c][sel].astype(np.float32) for c in chans], axis=-1)
         labels = f['labels'][sel].astype(np.float64)
     print(f"  (images cropped to {crop_cfg or grid_N} px, as make_dataset does)")
-    print(f"  recomputed from the current file: {ns_now:.4e} | saved in config: {cfg['norm_scale']:.4e} | "
+    print(f"  recomputed from the current file: {np.round(ns_now, 12).tolist()} | saved in config: "
+          f"{np.round(np.atleast_1d(cfg['norm_scale']), 12).tolist()} | "
           f"n_val now {n_val} vs config {cfg.get('n_val')}")
  
     print("---- (3) checkpoints on the same validation samples ----")
@@ -2377,6 +2095,8 @@ if choice == "ckpt_check":
     perm = twin_permutation(outer_positions)
     def val_mae(m):
         pred = predict_outer_phases(m, imgs, norm_scale, crop)
+        if len(norm_scale) == 2:                                  # diversity model: direct error
+            return np.degrees(np.abs(np.angle(np.exp(1j * (labels - pred))))).mean()
         return twin_aware_compare(pred, labels, perm)['err_deg'].mean()
     print(f"  best.weights.h5: {val_mae(model):.2f}°  (on {len(sel)} val samples)")
     for e in [int(x) for x in extra.split(',') if x.strip()]:
@@ -2389,3 +2109,560 @@ if choice == "ckpt_check":
     print("If best.weights.h5 is far above the log's best but an epoch checkpoint near the best epoch\n"
           "matches it, best.weights.h5 was overwritten by a later run. If every checkpoint is bad, the\n"
           "model code changed since training (layer order / sizes) - compare with the training version.")
+
+if choice == "photon_budget":
+    run_label = input("Run label to evaluate (e.g. training_div_v1)?\n").strip()
+    grid_N = int(input("Grid size used for the training data? (1024)\n") or 1024)
+    grid_ssl = int(input("Sampling used for the training data (0.1mm)? (20)\n") or 20)
+    r500 = float(input("r500 used for the training data? (0.05m)\n") or 0.05)
+    n_real = int(input("How many fresh realizations? (300 recommended)\n") or 300)
+    batch = int(input("Realizations per GPU batch? (4)\n") or 4)
+    seed = int(input("Random seed (use one never used for training data)?\n"))
+    levels_in = input("Detected photons per frame, total over both arms, comma-separated\n"
+                      "(blank = 1e3,3e3,1e4,3e4,1e5,3e5,1e6,3e6):\n").strip()
+    sigma_read = float(input("Read noise per pixel in photoelectrons? (0 = photon noise only; "
+                             "sCMOS ~1-2, InGaAs ~30-100)\n") or 0)
+    bkg = float(input("Background photons per pixel per frame? (0)\n") or 0)
+    t_frame = float(input("Frame (exposure) time in ms for the beacon-power estimate? (0.2)\n") or 0.2) * 1e-3
+    eta = float(input("Total throughput: atmosphere x optics x detector efficiency? (0.3)\n") or 0.3)
+    div_urad = float(input("Beacon full-angle divergence (1/e^2) in urad? (100)\n") or 100)
+    levels = np.array([float(v) for v in levels_in.split(',')] if levels_in
+                      else [1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6, 3e6])
+ 
+    array = ArrayDesign(2, 'hex')
+    dist = 384000000
+    sim = BeamPerturbator(ssl=grid_ssl * 1e-4, targ_pos=[0, 0, dist], array_des=array,
+                          r500=r500, Ideal=False, grid_length=grid_N)
+    sim.input_e_field_base()
+    gen = GPUDataGenerator(sim, seed=seed)
+    model, norm_scale, outer_positions, center_idx, crop = load_trained_model(run_label, grid_N, array)
+    perm = twin_permutation(outer_positions)
+    outer = np.delete(np.arange(len(sim.base_fields)), center_idx)
+    n_arms = len(norm_scale)
+    in_N = grid_N if crop is None else crop
+    print(f"total r0 = {(gen.r0 ** (-5 / 3)).sum() ** (-3 / 5) * 100:.1f} cm | camera region "
+          f"{in_N}x{in_N} px per arm, {n_arms} arm(s) | read noise {sigma_read} e- | background {bkg} ph/px")
+ 
+    def full_phases(outer_ph):
+        ph = np.zeros(len(sim.base_fields))
+        ph[outer] = outer_ph
+        return ph
+ 
+    def power(M, ph):
+        c = np.exp(1j * ph)
+        return float(np.real(c.conj() @ M @ c))
+ 
+    # ---- 1) simulate once: noise-free network-input crops, bucket matrices, optimum ----
+    clean, Ms, P_opt, P_zero, labels = [], [], [], [], []
+    div_ph = diversity_phases(sim.element_positions) if n_arms == 2 else None
+    done, t0 = 0, Timer.elapsed()
+    while done < n_real:
+        B = min(batch, n_real - done)
+        screens = gen.generate_screens(tf.constant(B), gen.r0_scale)
+        F, M = gen.far_fields(screens)
+        M = M.numpy().astype(np.complex128)
+        imgs = gen.images(F, tf.zeros([B, gen.L], tf.float32)).numpy()
+        if n_arms == 2:
+            div = gen.images(F, tf.tile(tf.constant(div_ph[None]), [B, 1])).numpy()
+            imgs = np.stack([imgs, div], axis=-1)
+        else:
+            imgs = imgs[..., None]
+        clean.append(center_crop(imgs, crop).astype(np.float32))   # only the read-out region
+        for b in range(B):
+            Mb = 0.5 * (M[b] + M[b].conj().T)
+            opt, Po, _ = optimal_phases_from_M(Mb, 100, center_idx)
+            Ms.append(Mb)
+            P_opt.append(Po)
+            P_zero.append(power(Mb, np.zeros(len(sim.base_fields))))
+            labels.append(np.delete(opt, center_idx))
+        done += B
+        print(f"  simulated {done}/{n_real}  ({(Timer.elapsed() - t0) / done:.2f} s each)", end='\r', flush=True)
+    clean = np.concatenate(clean)                               # [n, in_N, in_N, n_arms]
+    P_opt, P_zero, labels = np.array(P_opt), np.array(P_zero), np.array(labels)
+    arm_sum = clean[..., 0].sum(axis=(1, 2))                    # zero-phase arm, per frame
+    print(f"\nphotons per arm vary between frames by {arm_sum.std() / arm_sum.mean() * 100:.1f}% (rms) "
+          f"from scintillation and beam wander")
+ 
+    # beacon power at the Moon that delivers N_tot detected photons per frame
+    A_coll = len(sim.base_fields) * np.pi * sim.apert_radi ** 2
+    E_ph = 6.62607015e-34 * 2.99792458e8 / sim.wavelength
+    w = dist * div_urad * 1e-6 / 2
+ 
+    def beacon_power(N_tot):
+        irradiance = N_tot * E_ph / (t_frame * eta * A_coll)    # W/m^2 needed at the array
+        return irradiance * np.pi * w ** 2 / 2
+ 
+    # ---- 2) sweep photon levels on the same realizations ----
+    rng = np.random.default_rng(seed + 1)                       # noise draws, separate from screens
+    wrap = lambda v: np.angle(np.exp(1j * v))
+ 
+    def evaluate(net_in):
+        pred = predict_outer_phases(model, net_in, norm_scale, crop=None)   # already cropped
+        P_nn = np.array([power(Ms[i], full_phases(pred[i])) for i in range(len(pred))])
+        P_tw = np.array([power(Ms[i], full_phases(-pred[i][perm])) for i in range(len(pred))])
+        mae_direct = np.degrees(np.abs(wrap(labels - pred))).mean(1)
+        mae_twin = twin_aware_compare(pred, labels, perm)['err_deg'].mean(1)
+        return {'mae_direct': mae_direct.mean(), 'mae_twin_aware': mae_twin.mean(),
+                'ratio_nn_mean': (P_nn / P_opt).mean(), 'ratio_nn_median': np.median(P_nn / P_opt),
+                'ratio_twin_checked_mean': (np.maximum(P_nn, P_tw) / P_opt).mean(),
+                'beats_no_correction_pct': (P_nn > P_zero).mean() * 100}
+ 
+    rows = [{'photons_total': np.inf, 'photons_per_arm': np.inf, 'peak_px_photons_median': np.inf,
+             **evaluate(clean)}]
+    print(f"\n{'photons/frame':>13s} {'peak px':>9s} {'MAE direct':>11s} {'twin-aware':>11s} "
+          f"{'P/P_opt mean':>13s} {'median':>7s} {'twin-checked':>13s} {'beats P0':>9s} {'beacon':>10s}")
+ 
+    def show(r):
+        N_tot = r['photons_total']
+        beacon = f"{beacon_power(N_tot) * 1e3:.3g} mW" if np.isfinite(N_tot) else "-"
+        print(f"{N_tot:13.3g} {r['peak_px_photons_median']:9.3g} {r['mae_direct']:10.2f}° "
+              f"{r['mae_twin_aware']:10.2f}° {r['ratio_nn_mean']:13.3f} {r['ratio_nn_median']:7.3f} "
+              f"{r['ratio_twin_checked_mean']:13.3f} {r['beats_no_correction_pct']:8.1f}% {beacon:>10s}")
+    show(rows[0])
+    for N_tot in levels:
+        kappa = (N_tot / n_arms) / arm_sum.mean()               # photons per unit simulated intensity
+        noisy = np.empty_like(clean)
+        for s in range(0, len(clean), 32):                      # chunked to bound memory
+            n_exp = kappa * clean[s:s + 32].astype(np.float64)
+            counts = rng.poisson(n_exp + bkg).astype(np.float64) - bkg
+            if sigma_read > 0:
+                counts += rng.normal(0.0, sigma_read, counts.shape)
+            noisy[s:s + 32] = (counts / kappa).astype(np.float32)
+        r = {'photons_total': N_tot, 'photons_per_arm': N_tot / n_arms,
+             'peak_px_photons_median': float(np.median(kappa * clean[..., 0].max(axis=(1, 2)))),
+             **evaluate(noisy)}
+        rows.append(r)
+        show(r)
+    df = pd.DataFrame(rows)
+ 
+    df['beacon_power_W'] = [beacon_power(n) if np.isfinite(n) else np.nan for n in df['photons_total']]
+ 
+    ref = df.iloc[0]['ratio_nn_mean']
+    print(f"\nnoise-free: bucket power {ref:.3f} of optimum | no correction {(P_zero / P_opt).mean():.3f}")
+    print(f"beacon column: power the beacon must emit, for {t_frame * 1e3:.2f} ms frames, throughput {eta}, "
+          f"{div_urad:.0f} urad divergence (spot {2 * w / 1e3:.1f} km at the Moon), "
+          f"collecting area {A_coll * 1e4:.0f} cm^2")
+    fin = df.iloc[1:].sort_values('photons_total')
+    for tol in (0.01, 0.05):
+        # lowest tested level from which every higher level also stays within tol of noise-free
+        good = (fin['ratio_nn_mean'] >= ref - tol).values
+        k = len(good)
+        while k > 0 and good[k - 1]:
+            k -= 1
+        if k < len(good):
+            r = fin.iloc[k]
+            print(f"  within {tol:.2f} of noise-free bucket power from {r['photons_total']:.3g} photons/frame "
+                  f"(on the tested grid) -> beacon ~{r['beacon_power_W'] * 1e3:.3g} mW")
+        else:
+            print(f"  the highest tested level is not within {tol:.2f} of noise-free; test higher photon counts")
+ 
+    # ---- 3) save ----
+    out_dir = Path(f'outputs/analysis/{run_label}')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tag = f'seed{seed}_read{sigma_read:g}_bkg{bkg:g}'
+    df.to_csv(out_dir / f'photon_budget_{tag}.csv', index=False)
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    ax[0].semilogx(fin['photons_total'], fin['mae_direct'], 'o-', label='direct')
+    if n_arms == 1:
+        ax[0].semilogx(fin['photons_total'], fin['mae_twin_aware'], 's-', label='twin-aware')
+    ax[0].axhline(df.iloc[0]['mae_direct' if n_arms == 2 else 'mae_twin_aware'], ls='--', c='gray',
+                  label='noise-free')
+    ax[0].set_xlabel('detected photons per frame (all arms)')
+    ax[0].set_ylabel('validation MAE (deg)')
+    ax[0].legend()
+    ax[1].semilogx(fin['photons_total'], fin['ratio_nn_mean'], 'o-', label='NN output')
+    ax[1].axhline(ref, ls='--', c='gray', label='noise-free')
+    ax[1].axhline((P_zero / P_opt).mean(), ls=':', c='k', label='no correction')
+    ax[1].set_xlabel('detected photons per frame (all arms)')
+    ax[1].set_ylabel('mean bucket power / optimum')
+    ax[1].legend()
+    fig.suptitle(f'{run_label}: read noise {sigma_read:g} e-, background {bkg:g} ph/px, {n_real} realizations')
+    plt.tight_layout()
+    plt.savefig(out_dir / f'photon_budget_{tag}.png', dpi=120)
+    plt.close(fig)
+    print(f"table and plot: {out_dir / f'photon_budget_{tag}.csv'} (.png)")
+
+if choice == "time_eval":
+    grid_N = int(input("Grid size used for the training data? (1024)\n") or 1024)
+    grid_ssl = int(input("Sampling used for the training data (0.1mm)? (20)\n") or 20)
+    r500 = float(input("r500 used for the training data? (0.05m)\n") or 0.05)
+    wind_dir = input("Wind directions: aligned / random? (aligned)\n").strip() or 'aligned'
+    n_seq = int(input("How many independent sequences? (100)\n") or 100)
+    batch = int(input("Sequences per GPU batch? (4)\n") or 4)
+    seed = int(input("Random seed (use one never used for training data)?\n"))
+    delays_in = input("Delays in ms, comma-separated (blank = 0,0.1,0.25,0.5,1,2,4,8):\n").strip()
+    run_label = input("Run label for the network (blank = optimizer phases only):\n").strip()
+    delays = np.array([float(v) for v in delays_in.split(',')] if delays_in
+                      else [0, 0.1, 0.25, 0.5, 1, 2, 4, 8]) * 1e-3
+ 
+    array = ArrayDesign(2, 'hex')
+    dist = 384000000
+    sim = BeamPerturbator(ssl=grid_ssl * 1e-4, targ_pos=[0, 0, dist], array_des=array,
+                          r500=r500, Ideal=False, grid_length=grid_N)
+    sim.input_e_field_base()
+    gen = GPUDataGenerator(sim, seed=seed)
+    tau0_th = gen.set_wind(wind_dir, seed=seed)
+    r0_tot = (gen.r0 ** (-5 / 3)).sum() ** (-3 / 5)
+    print(f"total r0 = {r0_tot * 100:.1f} cm | tau0 (Kolmogorov, 6.88 sum (v_n/r0_n)^5/3) = {tau0_th * 1e3:.2f} ms | "
+          f"sequences valid up to {gen.max_time_s() * 1e3:.0f} ms")
+    print("layer  height  wind   dir    r0")
+    for n in range(gen.S):
+        print(f"  {n:2d}  {gen.layer_heights[n] / 1e3:5.2f} km {gen.wind_speed[n]:5.1f} m/s "
+              f"{np.degrees(gen.wind_angle[n]):4.0f}°  {gen.r0[n] * 100:7.1f} cm")
+    if delays.max() > gen.max_time_s():
+        print("WARNING: longest delay exceeds the screen period; the turbulence repeats")
+    wind = gen.wind.astype(np.float32)
+    shift_at = lambda t: tf.constant((wind * t).astype(np.float32))
+ 
+### section 1:
+    taus = np.array([0.25, 0.5, 1, 2, 4, 8, 16]) * 1e-3
+    taus = taus[taus < gen.max_time_s()]
+    a_hi = (gen.amp_hi.numpy().astype(np.float64)) ** 2                    # r0 = 1
+    a_lo = (gen.amp_lo.numpy().astype(np.float64)) ** 2                    # [3, 3, 3]
+    FXn, FYn, F3n = gen.FXg.numpy().astype(np.float64), gen.FYg.numpy().astype(np.float64), \
+        gen.F3.numpy().astype(np.float64)
+ 
+    def d_unit(dx, dy):           # structure function of an r0 = 1 screen at separation (dx, dy)
+        d = 2 * np.sum(a_hi * (1 - np.cos(2 * np.pi * (FXn * dx + FYn * dy))))
+        for p in range(3):
+            ph = 2 * np.pi * (F3n[p][:, None] * dy + F3n[p][None, :] * dx)
+            d += 2 * np.sum(a_lo[p] * (1 - np.cos(ph)))
+        return d
+    D_exp = np.array([sum(gen.r0[n] ** (-5 / 3) * d_unit(*(gen.wind[n] * t)) for n in range(gen.S))
+                      for t in taus])
+    D_kol = 6.88 * np.array([np.sum((gen.wind_speed * t / gen.r0) ** (5 / 3)) for t in taus])
+ 
+    sl = slice(None, None, max(1, grid_N // 128))          # every k-th pixel (screens are periodic)
+    D_sum, n_D = np.zeros(len(taus)), 0
+    n_sf = min(n_seq, 32)
+    for s in range(0, n_sf, batch):
+        B = min(batch, n_sf - s)
+        hi_c, lo_c = gen.draw_screen_coeffs(B)
+        p0 = tf.reduce_sum(gen.screens_from_coeffs(hi_c, lo_c, shift_at(0.0), False), axis=1).numpy()[:, sl, sl]
+        for i, tau in enumerate(taus):
+            pt = tf.reduce_sum(gen.screens_from_coeffs(hi_c, lo_c, shift_at(tau), False), axis=1).numpy()[:, sl, sl]
+            D_sum[i] += ((pt - p0) ** 2).sum()
+        n_D += p0.size
+    D_meas = D_sum / n_D
+    print(f"\ntemporal structure function of the summed screen phase ({n_sf} sequences):")
+    print("   tau     measured  expected(screens)  ratio    Kolmogorov  expected/Kolmogorov")
+    for t, dm, de, dk in zip(taus, D_meas, D_exp, D_kol):
+        print(f"  {t * 1e3:5.2f} ms  {dm:8.3f}  {de:12.3f}     {dm / de:6.3f}   {dk:9.3f}   {de / dk:8.3f}")
+ 
+    def crossing(D):              # log-log interpolation to D = 1 rad^2
+        k = np.searchsorted(D, 1.0)
+        if 0 < k < len(D):
+            return float(np.exp(np.interp(0.0, np.log(D[k - 1:k + 1]), np.log(taus[k - 1:k + 1]))))
+        return np.nan
+    print(f"tau0: Kolmogorov formula {tau0_th * 1e3:.2f} ms | expected for these screens "
+          f"{crossing(D_exp) * 1e3:.2f} ms | measured {crossing(D_meas) * 1e3:.2f} ms "
+          f"(nan = outside the tested taus)")
+ 
+    # ---- Part 2: servo lag ----
+    use_nn = bool(run_label)
+    if use_nn:
+        model, norm_scale, outer_positions, center_idx, crop = load_trained_model(run_label, grid_N, array)
+        div_ph = diversity_phases(sim.element_positions) if len(norm_scale) == 2 else None
+    outer = np.delete(np.arange(gen.L), gen.center_idx)
+ 
+    def power(M, ph):
+        c = np.exp(1j * ph)
+        return float(np.real(c.conj() @ M @ c))
+ 
+    def full(outer_ph):
+        ph = np.zeros(gen.L)
+        ph[outer] = outer_ph
+        return ph
+ 
+    R = {key: [[] for _ in delays] for key in ('zero', 'opt0', 'nn0')}
+    done, t0 = 0, Timer.elapsed()
+    while done < n_seq:
+        B = min(batch, n_seq - done)
+        hi_c, lo_c = gen.draw_screen_coeffs(B)
+        F0, M0 = gen.far_fields(gen.screens_from_coeffs(hi_c, lo_c, shift_at(0.0)))
+        M0 = M0.numpy().astype(np.complex128)
+        opt0 = []
+        for b in range(B):
+            ph, _, _ = optimal_phases_from_M(0.5 * (M0[b] + M0[b].conj().T), 100, gen.center_idx)
+            opt0.append(ph)
+        if use_nn:
+            img = gen.images(F0, tf.zeros([B, gen.L], tf.float32)).numpy()
+            if div_ph is not None:
+                img = np.stack([img, gen.images(F0, tf.tile(tf.constant(div_ph[None]), [B, 1])).numpy()], -1)
+            nn0 = predict_outer_phases(model, img, norm_scale, crop)
+        for i, d in enumerate(delays):
+            if d == 0:
+                Md = M0
+            else:
+                _, Md = gen.far_fields(gen.screens_from_coeffs(hi_c, lo_c, shift_at(d)))
+                Md = Md.numpy().astype(np.complex128)
+            for b in range(B):
+                Mb = 0.5 * (Md[b] + Md[b].conj().T)
+                _, P_opt, _ = optimal_phases_from_M(Mb, 100, gen.center_idx)
+                R['zero'][i].append(power(Mb, np.zeros(gen.L)) / P_opt)
+                R['opt0'][i].append(power(Mb, opt0[b]) / P_opt)
+                if use_nn:
+                    R['nn0'][i].append(power(Mb, full(nn0[b])) / P_opt)
+        done += B
+        print(f"  {done}/{n_seq} sequences ({(Timer.elapsed() - t0) / done:.2f} s each)", end='\r', flush=True)
+ 
+    print(f"\n\nbucket power / optimum at time d, phases computed from the frame at t = 0 "
+          f"({n_seq} sequences, tau0 = {tau0_th * 1e3:.2f} ms):")
+    print(f"  {'delay':>8s} {'d/tau0':>7s} {'no corr':>8s} {'optimizer(0)':>13s}" + (f" {'NN(0)':>8s}" if use_nn else ""))
+    rows = []
+    for i, d in enumerate(delays):
+        r = {'delay_ms': d * 1e3, 'd_over_tau0': d / tau0_th, 'no_correction': np.mean(R['zero'][i]),
+             'optimizer_t0': np.mean(R['opt0'][i])}
+        if use_nn:
+            r['nn_t0'] = np.mean(R['nn0'][i])
+        rows.append(r)
+        print(f"  {d * 1e3:6.2f}ms {d / tau0_th:7.2f} {r['no_correction']:8.3f} {r['optimizer_t0']:13.3f}"
+              + (f" {r['nn_t0']:8.3f}" if use_nn else ""))
+    df = pd.DataFrame(rows)
+    out_dir = Path('outputs/analysis/time_eval')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"seed{seed}_{wind_dir}" + (f"_{run_label}" if use_nn else "")
+    df.to_csv(out_dir / f'servo_lag_{tag}.csv', index=False)
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    ax[0].loglog(taus * 1e3, D_meas, 'o-', label='measured')
+    ax[0].loglog(taus * 1e3, D_exp, '--', label='expected for these screens')
+    ax[0].loglog(taus * 1e3, D_kol, ':', label='Kolmogorov 6.88 Σ (v_n τ / r0_n)^{5/3}')
+    ax[0].axhline(1, c='gray', lw=0.8)
+    ax[0].set_xlabel('τ (ms)')
+    ax[0].set_ylabel('D_φ(τ)  (rad²)')
+    ax[0].legend()
+    ax[1].plot(df['delay_ms'], df['optimizer_t0'], 'o-', label='optimizer phases from t=0')
+    if use_nn:
+        ax[1].plot(df['delay_ms'], df['nn_t0'], 's-', label='network from t=0 image')
+    ax[1].plot(df['delay_ms'], df['no_correction'], ':', c='k', label='no correction')
+    ax[1].axvline(tau0_th * 1e3, c='gray', lw=0.8, ls='--')
+    ax[1].set_xlabel('delay before the correction is applied (ms)')
+    ax[1].set_ylabel('bucket power / optimum at that time')
+    ax[1].legend()
+    plt.tight_layout()
+    plt.savefig(out_dir / f'servo_lag_{tag}.png', dpi=120)
+    plt.close(fig)
+    print(f"table and plot: {out_dir / f'servo_lag_{tag}.csv'} (.png)")
+
+if choice == "spgd_eval":
+    grid_N = int(input("Grid size used for the training data? (1024)\n") or 1024)
+    grid_ssl = int(input("Sampling used for the training data (0.1mm)? (20)\n") or 20)
+    r500 = float(input("r500 used for the training data? (0.05m)\n") or 0.05)
+    wind_dir = input("Wind directions: aligned / random? (aligned)\n").strip() or 'aligned'
+    n_seq = int(input("How many independent sequences? (32)\n") or 32)
+    batch = int(input("Sequences per GPU batch? (4)\n") or 4)
+    seed = int(input("Random seed (use one never used for training data)?\n"))
+    T_ms = float(input("Sequence length in ms (blank = 90% of the screen period):\n") or 0)
+    dtc_ms = float(input("Propagation (coarse) time step in ms? (0.1)\n") or 0.1)
+    mode = input("SPGD metric: beacon (receive-side actuators) / target (retroreflector return)? "
+                 "(beacon)\n").strip() or 'beacon'
+    f_iter = float(input("SPGD iteration rate in kHz (two measurements per iteration)? (100)\n") or 100) * 1e3
+    gains = [float(v) for v in (input("SPGD gains, comma-separated (blank = 0.5,1,2,4):\n").strip()
+                                or "0.5,1,2,4").split(',')]
+    dithers = [float(v) for v in (input("Dither amplitudes in rad, comma-separated "
+                                        "(blank = 0.1,0.2,0.3):\n").strip() or "0.1,0.2,0.3").split(',')]
+    lat_us = float(input("Detector + electronics latency per measurement in us? (0)\n") or 0)
+    dist = 384000000
+    t_rt = 2 * dist / 2.99792458e8
+    if mode == 'target':
+        rt_in = input(f"Round-trip delay in ms (blank = 2z/c = {t_rt * 1e3:.0f} ms):\n").strip()
+        t_rt = float(rt_in) * 1e-3 if rt_in else t_rt
+    else:
+        t_rt = 0.0
+    phi_rate = float(input("Detected photons per second at the SPGD detector when corrected? "
+                           "(1e9)\n") or 1e9)
+    sigma_det = float(input("SPGD detector noise per sample in photoelectrons? (0)\n") or 0)
+    f_act_in = input("Actuator bandwidth in kHz (blank = ideal):\n").strip()
+    f_act = float(f_act_in) * 1e3 if f_act_in else np.inf
+    rng_in = input("Actuator range in rad before a 2 pi reset (blank = unlimited):\n").strip()
+    act_range = float(rng_in) if rng_in else np.inf
+    sigma_psi = float(input("Transmit-channel phase noise rms in rad? (0)\n") or 0)
+    f_psi = float(input("Transmit-channel phase noise bandwidth in Hz? (1000)\n") or 1000)
+    sigma_cal = float(input("Per-channel phase calibration error, rms fraction (e.g. 0.02)? (0)\n") or 0)
+    t_burn = float(input("Start of the steady-state average in ms? (5)\n") or 5) * 1e-3
+    run_label = input("Run label for the network comparison (blank = skip):\n").strip()
+    if run_label:
+        t_frame = float(input("Camera frame period in ms? (0.2)\n") or 0.2) * 1e-3
+        nn_lat = float(input("Network latency (frame -> correction applied) in ms? (0.2)\n") or 0.2) * 1e-3
+        sigma_cam = float(input("Camera read noise per pixel in photoelectrons? (1)\n") or 1)
+ 
+    array = ArrayDesign(2, 'hex')
+    sim = BeamPerturbator(ssl=grid_ssl * 1e-4, targ_pos=[0, 0, dist], array_des=array,
+                          r500=r500, Ideal=False, grid_length=grid_N)
+    sim.input_e_field_base()
+    gen = GPUDataGenerator(sim, seed=seed)
+    tau0 = gen.set_wind(wind_dir, seed=seed)
+    T = 0.9 * gen.max_time_s() if T_ms <= 0 else T_ms * 1e-3
+    if T > gen.max_time_s():
+        raise ValueError(f"{T * 1e3:.0f} ms is longer than the screen period "
+                         f"{gen.max_time_s() * 1e3:.0f} ms; the turbulence would repeat")
+    dtc = dtc_ms * 1e-3
+    K = int(round(T / dtc)) + 1
+    t_coarse = np.arange(K) * dtc
+    T = t_coarse[-1]
+    wind = gen.wind.astype(np.float32)
+    shift_at = lambda t: tf.constant((wind * t).astype(np.float32))
+    L = gen.L
+    outer = np.delete(np.arange(L), gen.center_idx)
+    cx = int(np.argmin(np.abs(gen.x_out - sim.target_position[0])))   # same pixel as the bucket centre
+    cy = int(np.argmin(np.abs(gen.x_out - sim.target_position[1])))
+    delay_iter = int(round((t_rt + lat_us * 1e-6) * f_iter))
+    print(f"total r0 {(gen.r0 ** (-5 / 3)).sum() ** (-3 / 5) * 100:.1f} cm | tau0 (Kolmogorov) "
+          f"{tau0 * 1e3:.2f} ms | {n_seq} sequences of {T * 1e3:.1f} ms | propagation every "
+          f"{dtc * 1e3:.2f} ms ({K} steps per sequence)")
+    print(f"SPGD: {mode} metric, {f_iter / 1e3:.0f} kHz, measurement delay {delay_iter} iterations "
+          f"({delay_iter / f_iter * 1e3:.3f} ms), {len(gains) * len(dithers)} gain/dither settings")
+    if mode == 'target' and delay_iter * 2 >= T / (0.5 / f_iter):
+        print("WARNING: the round trip is longer than the sequence; no measurement ever reaches "
+              "the controller, so SPGD cannot correct anything here")
+ 
+    use_nn = bool(run_label)
+    if use_nn:
+        model, norm_scale, outer_positions, center_idx_nn, crop = load_trained_model(run_label, grid_N, array)
+        n_arms = len(norm_scale)
+        div_ph = diversity_phases(sim.element_positions) if n_arms == 2 else None
+        frame_every = int(round(t_frame / dtc))
+        if abs(frame_every * dtc - t_frame) > 1e-9 or frame_every < 1:
+            raise ValueError("the camera frame period must be a whole number of coarse time steps")
+ 
+    def power(Mb, ph):
+        c = np.exp(1j * ph)
+        return float(np.real(c.conj() @ Mb @ c))
+ 
+    rng = np.random.default_rng(seed + 7)
+    sums = None
+    steady_rows, n_done, t0 = [], 0, Timer.elapsed()
+    interp_checked = False
+    while n_done < n_seq:
+        B = min(batch, n_seq - n_done)
+        hi_c, lo_c = gen.draw_screen_coeffs(B)
+        M_c = np.zeros((K, B, L, L), np.complex128)
+        v_c = np.zeros((K, B, L), np.complex128)
+        Popt_c = np.zeros((K, B))
+        opt_ph0 = np.zeros((B, L))
+        P_window = np.zeros(B)
+        nn_ph, kappa = [], None
+        for k in range(K):
+            F, M = gen.far_fields(gen.screens_from_coeffs(hi_c, lo_c, shift_at(t_coarse[k])))
+            Mk = M.numpy().astype(np.complex128)
+            Mk = 0.5 * (Mk + np.conj(np.transpose(Mk, (0, 2, 1))))
+            M_c[k] = Mk
+            v_c[k] = F[:, :, cy, cx].numpy()
+            for b in range(B):
+                ph, Popt_c[k, b], _ = optimal_phases_from_M(Mk[b], 100, gen.center_idx)
+                if k == 0:
+                    opt_ph0[b] = ph
+            if k == 0:
+                P_window = tf.reduce_sum(gen.images(F, tf.zeros([B, L], tf.float32)), axis=[1, 2]).numpy()
+            if use_nn and k % frame_every == 0:
+                img = gen.images(F, tf.zeros([B, L], tf.float32)).numpy()
+                img = (np.stack([img, gen.images(F, tf.tile(tf.constant(div_ph[None]), [B, 1])).numpy()], -1)
+                       if n_arms == 2 else img[..., None])
+                img = center_crop(img, crop)
+                if kappa is None:   # photons per unit intensity, fixed from the first frame
+                    bucket_frac = Popt_c[0].mean() / P_window.mean()
+                    N_frame = phi_rate / bucket_frac * t_frame          # same beacon, whole focal plane
+                    kappa = (N_frame / n_arms) / img[..., 0].sum(axis=(1, 2)).mean()
+                nn_ph.append(predict_outer_phases(model, camera_frames(img, kappa, sigma_cam, rng),
+                                                  norm_scale, crop=None))
+            print(f"  sequences {n_done + 1}-{n_done + B}: propagation step {k + 1}/{K}", end='\r', flush=True)
+ 
+        # ---- check the linear interpolation between propagation steps (first batch) ----
+        if not interp_checked:
+            errs = []
+            for k in np.linspace(0, K - 2, min(5, K - 1)).astype(int):
+                tm = t_coarse[k] + 0.5 * dtc
+                _, Md = gen.far_fields(gen.screens_from_coeffs(hi_c, lo_c, shift_at(tm)))
+                Md = Md.numpy().astype(np.complex128)
+                Mi = interp_traces(t_coarse, M_c, tm)
+                for b in range(B):
+                    for ph in (opt_ph0[b], rng.uniform(-np.pi, np.pi, L)):
+                        Pd = power(0.5 * (Md[b] + Md[b].conj().T), ph)
+                        errs.append(abs(power(Mi[b], ph) - Pd) / Pd)
+            errs = np.array(errs)
+            print(f"\ninterpolation check at mid-steps: bucket-power error mean {errs.mean() * 100:.3f}%, "
+                  f"max {errs.max() * 100:.3f}%  (reduce the coarse step if this is not << 1%)")
+            interp_checked = True
+ 
+        J_ref = (Popt_c[0].mean() if mode == 'beacon' else
+                 np.mean([abs(np.exp(1j * opt_ph0[b]) @ v_c[0, b]) ** 2 * np.sum(abs(v_c[0, b]) ** 2)
+                          for b in range(B)]))
+        trace = {'t': t_coarse, 'M': M_c, 'P_opt': Popt_c, 'v': v_c, 'outer': outer,
+                 'nn': np.array(nn_ph) if use_nn else None,
+                 't_frame': t_frame if use_nn else None, 'nn_latency': nn_lat if use_nn else None}
+        cfg = {'mode': mode, 'gains': gains, 'dithers': dithers, 'f_iter': f_iter,
+               'delay_iter': delay_iter, 't_rt': t_rt, 'f_act': f_act, 'act_range': act_range,
+               'sigma_cal': sigma_cal, 'sigma_psi': sigma_psi, 'f_psi': f_psi,
+               'phi_rate': phi_rate, 'sigma_det': sigma_det, 'J_ref': J_ref, 't_burn': t_burn}
+        res = simulate_spgd(trace, cfg, rng)
+        if sums is None:
+            sums = {key: np.zeros_like(res[key]) for key in ('ratio_spgd', 'ratio_zero')}
+            sums['ratio_nn'] = np.zeros_like(res['ratio_zero'])
+            steady_s, steady_n = [], []
+        for key in ('ratio_spgd', 'ratio_zero'):
+            sums[key] += res[key] * B
+        if use_nn:
+            sums['ratio_nn'] += res['ratio_nn'] * B
+            steady_n.append(res['steady_nn'])
+        steady_s.append(res['steady_spgd'])
+        n_done += B
+        print(f"\n  {n_done}/{n_seq} sequences done ({(Timer.elapsed() - t0) / n_done:.1f} s each)")
+ 
+    t_f = res['t']
+    curves = {key: v / n_seq for key, v in sums.items()}
+    steady_s = np.concatenate(steady_s, axis=1)                     # [G, n_seq]
+    win = lambda c, a, b: c[..., (t_f >= a) & (t_f < b)].mean(-1)
+    bucket_frac = Popt_c[0].mean() / P_window.mean()
+    print(f"\nphoton scale: {phi_rate:.3g} photons/s at the SPGD detector when corrected = "
+          f"{phi_rate * 0.5 / f_iter:.3g} per measurement; the same beacon gives "
+          f"{phi_rate / bucket_frac * 2e-4:.3g} photons per 0.2 ms camera frame (photon_budget units)")
+    print(f"bucket power / optimum, mean over {n_seq} sequences "
+          f"(steady state = t >= {t_burn * 1e3:.1f} ms, ± = sequence-to-sequence std error):")
+    print(f"  {'gain':>6s} {'dither':>7s} {'0-1 ms':>8s} {'1-5 ms':>8s} {'steady':>8s}")
+    rows = []
+    for g_i in range(len(res['gains'])):
+        st = steady_s[g_i]
+        r = {'gain': res['gains'][g_i], 'dither_rad': res['dithers'][g_i],
+             'first_1ms': win(curves['ratio_spgd'][g_i], 0, 1e-3),
+             '1_to_5ms': win(curves['ratio_spgd'][g_i], 1e-3, 5e-3),
+             'steady': st.mean(), 'steady_se': st.std() / np.sqrt(len(st))}
+        rows.append(r)
+        print(f"  {r['gain']:6.2f} {r['dither_rad']:7.2f} {r['first_1ms']:8.3f} {r['1_to_5ms']:8.3f} "
+              f"{r['steady']:8.3f} ± {r['steady_se']:.3f}")
+    best = int(np.argmax([r['steady'] for r in rows]))
+    print(f"best SPGD setting: gain {rows[best]['gain']:g}, dither {rows[best]['dither_rad']:g} rad "
+          f"-> {rows[best]['steady']:.3f}")
+    print(f"no correction (with the channel noise): {win(curves['ratio_zero'], t_burn, np.inf):.3f}")
+    if use_nn:
+        st = np.concatenate(steady_n)
+        print(f"network ({t_frame * 1e3:.2f} ms frames, {nn_lat * 1e3:.2f} ms latency, "
+              f"{sigma_cam:g} e- read noise): {st.mean():.3f} ± {st.std() / np.sqrt(len(st)):.3f}")
+ 
+    out_dir = Path('outputs/analysis/spgd_eval')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"seed{seed}_{mode}_{f_iter / 1e3:.0f}kHz" + (f"_{run_label}" if use_nn else "")
+    pd.DataFrame(rows).to_csv(out_dir / f'spgd_settings_{tag}.csv', index=False)
+    stride = max(1, len(t_f) // 4000)
+    ts = {'t_ms': t_f[::stride] * 1e3, 'spgd_best': curves['ratio_spgd'][best][::stride],
+          'no_correction': curves['ratio_zero'][::stride]}
+    if use_nn:
+        ts['network'] = curves['ratio_nn'][::stride]
+    pd.DataFrame(ts).to_csv(out_dir / f'spgd_timeseries_{tag}.csv', index=False)
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(ts['t_ms'], ts['spgd_best'], label=f"SPGD (gain {rows[best]['gain']:g}, "
+                                                  f"dither {rows[best]['dither_rad']:g} rad)")
+    if use_nn:
+        ax.plot(ts['t_ms'], ts['network'], label='network')
+    ax.plot(ts['t_ms'], ts['no_correction'], ':', c='k', label='no correction')
+    ax.axvline(t_burn * 1e3, c='gray', lw=0.8, ls='--')
+    ax.set_xlabel('time (ms)')
+    ax.set_ylabel('bucket power / optimum (mean over sequences)')
+    ax.set_title(f'{mode} metric, {f_iter / 1e3:.0f} kHz, tau0 {tau0 * 1e3:.1f} ms')
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(out_dir / f'spgd_timeseries_{tag}.png', dpi=120)
+    plt.close(fig)
+    print(f"tables and plot: {out_dir}/spgd_*_{tag}.*")
+
+if choice == "headroom":
+    r500s = [0.1,0.15,0.2]
