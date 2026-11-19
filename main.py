@@ -105,7 +105,7 @@ class TurbulenceModeler:
     def cn2(self, h_km, v_rms, b_val = None):
         b = self.b_val if b_val is None else b_val
         return (5.94e-23 * h_km ** 10 * (v_rms / 27) ** 2 * np.exp(-h_km)
-               + self.b_val * 2.7e-16 * np.exp(-2 * h_km / 3))
+               + b * 2.7e-16 * np.exp(-2 * h_km / 3))
 
     def hv_fried_param(self, height1, height2, wavelen = 500e-9, b_val=None):
         h_km = np.linspace(height1 / 1000, height2 / 1000, num=100)
@@ -115,7 +115,7 @@ class TurbulenceModeler:
         return (0.423 * k_wavenum ** 2 * integral) ** (-3 / 5)
     
     def layer_r0(self, h1, h2):
-        return self.hv_fried_param(h1, h2, self.b_val, self.wavelen)
+        return self.hv_fried_param(h1, h2, self.wavelen, self.b_val)
 
     def phase_screen_gen(self, height1, height2):
         r0 = self.layer_r0(height1, height2)
